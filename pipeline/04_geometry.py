@@ -13,9 +13,9 @@ Wall extraction:
   vertical grouped by x-bucket, gap tolerance = 25pt (< typical door opening ~25pt).
 
 Calibration:
-  Flash identifies the actual 20490 dimension line from nearby path candidates
-  and returns a measured mm/pt ratio.  All coordinate conversions use this
-  measured value; nominal 35.28 is fallback only.
+  Flash identifies the dimension line matching GT_OVERALL_MM (or the largest
+  dimension string when GT is unknown) and returns a measured mm/pt ratio.
+  All coordinate conversions use this measured value; nominal 35.28 is fallback.
 """
 
 import json
@@ -424,7 +424,7 @@ def find_calibration_candidates(drawings: list[dict], dim_x: float, dim_y: float
     return candidates
 
 
-def calibrate_with_flash(candidates: list[dict], dim_pos: dict) -> dict:
+def calibrate_with_flash(candidates: list[dict], dim_pos: dict, target_mm: int) -> dict:
     if not candidates:
         logger.warn("No calibration candidates — using nominal")
         return _nominal_calibration("nominal_no_candidates")
@@ -432,7 +432,7 @@ def calibrate_with_flash(candidates: list[dict], dim_pos: dict) -> dict:
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
     lines = [
-        f"Dimension text '20490' at PDF point ({dim_pos['x_pt']:.1f}, {dim_pos['y_pt']:.1f}).",
+        f"Dimension text '{target_mm}' at PDF point ({dim_pos['x_pt']:.1f}, {dim_pos['y_pt']:.1f}).",
         f"{len(candidates)} candidate paths found:",
         "",
     ]
@@ -486,7 +486,7 @@ def calibrate_with_flash(candidates: list[dict], dim_pos: dict) -> dict:
 
             return {
                 "method":             "flash_measured",
-                "expected_mm":        GT_OVERALL_MM,
+                "expected_mm":        target_mm,
                 "measured_span_pts":  round(span, 2),
                 "computed_mm_per_pt": round(mm_pt, 6),
                 "nominal_mm_per_pt":  MM_PER_PT,
@@ -507,19 +507,27 @@ def calibrate_with_flash(candidates: list[dict], dim_pos: dict) -> dict:
 
 
 def calibrate(drawings: list[dict], rooms_data: dict) -> dict:
-    dims   = rooms_data.get("dimension_strings", [])
-    target = [d for d in dims if d["value"] == 20490]
+    dims = rooms_data.get("dimension_strings", [])
 
     logger.section("Scale calibration")
     logger.log(f"Nominal: 1:100, A3  →  {MM_PER_PT:.6f} mm/pt")
 
-    if not target:
-        logger.warn("20490 text not found — using nominal calibration")
+    # Find the calibration dimension: use GT when known, else pick the largest dim string
+    if GT_OVERALL_MM:
+        target = [d for d in dims if d["value"] == GT_OVERALL_MM]
+        target_mm = GT_OVERALL_MM
+    else:
+        sorted_dims = sorted(dims, key=lambda d: -d["value"])
+        target = sorted_dims[:1]
+        target_mm = target[0]["value"] if target else None
+
+    if not target or target_mm is None:
+        logger.warn("Calibration dimension not found — using nominal calibration")
         return _nominal_calibration("nominal_dim_not_found")
 
     dim = target[0]
-    logger.log(f"20490 text at ({dim['x_pt']:.1f}, {dim['y_pt']:.1f})")
-    logger.log(f"Expected span at nominal: {GT_OVERALL_MM / MM_PER_PT:.1f} pts")
+    logger.log(f"Calibration target: {target_mm} mm  at ({dim['x_pt']:.1f}, {dim['y_pt']:.1f})")
+    logger.log(f"Expected span at nominal: {target_mm / MM_PER_PT:.1f} pts")
 
     candidates = find_calibration_candidates(drawings, dim["x_pt"], dim["y_pt"])
     logger.log(f"Calibration candidates: {len(candidates)}")
@@ -529,7 +537,7 @@ def calibrate(drawings: list[dict], rooms_data: dict) -> dict:
             f"stroke={c['width_pts']}  cmds={c['items_summary']}",
             indent=1,
         )
-    return calibrate_with_flash(candidates, {"x_pt": dim["x_pt"], "y_pt": dim["y_pt"]})
+    return calibrate_with_flash(candidates, {"x_pt": dim["x_pt"], "y_pt": dim["y_pt"]}, target_mm)
 
 
 def _nominal_calibration(method: str = "nominal", reasoning: str = "") -> dict:
@@ -595,16 +603,20 @@ def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_d
         walls_mm = [to_real_coords(w["rect"], page_h, mm) for w in raw_walls]
 
     # Span validation — auto-invalidate if contaminated
-    span_valid, actual_span = validate_wall_span(walls_mm, GT_OVERALL_MM)
-    if not span_valid and walls_mm:
-        logger.warn(
-            f"Span check FAILED: actual={actual_span:.0f}mm  expected≈{GT_OVERALL_MM}mm  "
-            f"→ invalidating wall set (forcing to 0)"
-        )
-        walls_mm = []
-    else:
-        logger.log(f"Span check: actual={actual_span:.0f}mm  expected≈{GT_OVERALL_MM}mm  "
-                   f"delta={abs(actual_span - GT_OVERALL_MM):.0f}mm  valid={span_valid}")
+    expected_span_mm = calibration.get("expected_mm") or GT_OVERALL_MM
+    if expected_span_mm and walls_mm:
+        span_valid, actual_span = validate_wall_span(walls_mm, expected_span_mm)
+        if not span_valid:
+            logger.warn(
+                f"Span check FAILED: actual={actual_span:.0f}mm  expected≈{expected_span_mm}mm  "
+                f"→ invalidating wall set (forcing to 0)"
+            )
+            walls_mm = []
+        else:
+            logger.log(f"Span check: actual={actual_span:.0f}mm  expected≈{expected_span_mm}mm  "
+                       f"delta={abs(actual_span - expected_span_mm):.0f}mm  valid={span_valid}")
+    elif walls_mm:
+        logger.warn("No calibration reference — skipping span check")
 
     # Room centroids → mm
     room_centroids_mm = []

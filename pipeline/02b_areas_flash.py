@@ -257,16 +257,19 @@ def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> dict:
 
 if __name__ == "__main__":
     import argparse
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     parser = argparse.ArgumentParser(description="Stage 2b: Flash area extraction")
-    parser.add_argument(
-        "--classifications",
-        type=Path,
-        default=OUTPUT_DIR / "classification_report_flash.json",
-        help="Path to classification JSON (default: output/classification_report_flash.json)",
-    )
+    parser.add_argument("--pdf", type=Path, default=PDF_PATH,
+                        help="Path to PDF (default: config.PDF_PATH)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory (default: config.OUTPUT_DIR)")
+    parser.add_argument("--classifications", type=Path, default=None,
+                        help="Path to classification JSON (default: <output-dir>/classification_report_flash.json)")
     args = parser.parse_args()
 
-    cl = json.loads(args.classifications.read_text())
-    main(PDF_PATH, cl, OUTPUT_DIR)
+    out_dir = args.output_dir or OUTPUT_DIR
+    cl_path = args.classifications or (out_dir / "classification_report_flash.json")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cl = json.loads(cl_path.read_text())
+    main(args.pdf, cl, out_dir)

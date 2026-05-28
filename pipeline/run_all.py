@@ -40,7 +40,6 @@ def build_final_json(classifications, areas_data, rooms_data, geometry_data, val
         "geometry": {
             "scale":              "1:100",
             "calibration":        geometry_data.get("calibration", {}),
-            "overall_length_mm":  20490,
             "use_wall_geometry":  geometry_data.get("use_wall_geometry"),
             "wall_count":         geometry_data.get("wall_count"),
             "walls":              geometry_data.get("walls", []),
@@ -118,9 +117,9 @@ def main():
         p = OUTPUT_DIR / fname
         return json.loads(p.read_text()) if p.exists() else None
 
-    # Load cached outputs for skipped stages
+    # Load cached outputs for skipped stages — prefer Flash output over regex
     if args.stage > 1:
-        classifications = cached("classification_report.json")
+        classifications = cached("classification_report_flash.json") or cached("classification_report.json")
     if args.stage > 2:
         areas_data = cached("areas_flash.json") or cached("areas.json")
     if args.stage > 3:
@@ -131,9 +130,9 @@ def main():
         validation_data = cached("validation.json")
 
     stages = [
-        (1, "Page classification",   "01_classify.py"),
-        (2, "Area schedule",         "02_areas.py"),
-        (3, "Room inventory",        "03_rooms.py"),
+        (1, "Page classification",   "01b_classify_flash.py"),
+        (2, "Area schedule",         "02b_areas_flash.py"),
+        (3, "Room inventory",        "03b_rooms_flash.py"),
         (4, "Wall geometry",         "04_geometry.py"),
         (5, "Validation",            "05_validate.py"),
         (6, "SVG render",            "06_render.py"),

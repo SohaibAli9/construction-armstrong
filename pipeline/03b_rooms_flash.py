@@ -19,6 +19,7 @@ from config import (
     PDF_PATH, OUTPUT_DIR,
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH,
     DEEPSEEK_FLASH_INPUT_COST, DEEPSEEK_FLASH_OUTPUT_COST,
+    GT_OVERALL_MM,
 )
 
 MAX_RETRIES = 3
@@ -198,11 +199,15 @@ def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> dict:
         if DIM_RE.fullmatch(s["label"]) and 100 <= int(s["label"]) <= 50000
     ]
     logger.log(f"Dimension strings extracted: {len(dim_strings)}")
-    exact_20490 = [d for d in dim_strings if d["value"] == 20490]
-    if exact_20490:
-        logger.log(f"20490 FOUND at ({exact_20490[0]['x_pt']:.1f}, {exact_20490[0]['y_pt']:.1f})")
-    else:
-        logger.warn("20490 NOT FOUND in dimension strings")
+    if GT_OVERALL_MM:
+        exact_target = [d for d in dim_strings if d["value"] == GT_OVERALL_MM]
+        if exact_target:
+            logger.log(f"{GT_OVERALL_MM} FOUND at ({exact_target[0]['x_pt']:.1f}, {exact_target[0]['y_pt']:.1f})")
+        else:
+            logger.warn(f"{GT_OVERALL_MM} NOT FOUND in dimension strings")
+    elif dim_strings:
+        largest = max(dim_strings, key=lambda d: d["value"])
+        logger.log(f"No GT_OVERALL_MM set — largest dim string: {largest['value']} at ({largest['x_pt']:.1f}, {largest['y_pt']:.1f})")
 
     diff_vs_python(flash_rooms, output_dir / "rooms.json")
 

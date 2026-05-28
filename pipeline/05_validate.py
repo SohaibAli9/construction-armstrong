@@ -30,7 +30,12 @@ def _load_narrative_prompt() -> str:
     return _NARRATIVE_PROMPT
 
 
-def check_area(label: str, extracted, expected: float, flags: list) -> dict:
+def check_area(label: str, extracted, expected, flags: list) -> dict:
+    if expected is None:
+        val = (extracted.get("value") if isinstance(extracted, dict) else extracted) if extracted else None
+        logger.log(f"{label:<25}  no ground truth — extracted={val}", indent=1)
+        return {"expected": None, "extracted": val, "delta": None, "status": "SKIP"}
+
     logger.log(f"{label:<25}  expected={expected}", indent=1)
     if extracted is None:
         flags.append(f"MISSING: {label} not extracted")
@@ -57,12 +62,15 @@ def check_coverage(areas: dict, flags: list) -> dict:
 
     results = {}
 
-    logger.log(f"{'site_coverage_pct':<25}  expected={GT_COVERAGE_PCT}%", indent=1)
-    if pct_extracted is None:
+    if GT_COVERAGE_PCT is None:
+        logger.log(f"{'site_coverage_pct':<25}  no ground truth — extracted={pct_extracted}", indent=1)
+        results["site_coverage_pct"] = {"expected": None, "extracted": pct_extracted, "status": "SKIP"}
+    elif pct_extracted is None:
         flags.append("MISSING: site_coverage_pct not extracted")
         logger.warn("site_coverage_pct not extracted")
         results["site_coverage_pct"] = {"status": "MISSING"}
     else:
+        logger.log(f"{'site_coverage_pct':<25}  expected={GT_COVERAGE_PCT}%", indent=1)
         delta  = abs(pct_extracted - GT_COVERAGE_PCT)
         status = "PASS" if delta <= COVERAGE_TOLERANCE else "FAIL"
         logger.log(f"  extracted={pct_extracted}%  delta={delta:.3f}  → {status}", indent=2)
@@ -73,12 +81,15 @@ def check_coverage(areas: dict, flags: list) -> dict:
             "delta": round(delta, 3), "status": status,
         }
 
-    logger.log(f"{'site_coverage_m2':<25}  expected={GT_COVERAGE_M2} m²", indent=1)
-    if m2_extracted is None:
+    if GT_COVERAGE_M2 is None:
+        logger.log(f"{'site_coverage_m2':<25}  no ground truth — extracted={m2_extracted}", indent=1)
+        results["site_coverage_m2"] = {"expected": None, "extracted": m2_extracted, "status": "SKIP"}
+    elif m2_extracted is None:
         flags.append("MISSING: site_coverage_m2 not extracted")
         logger.warn("site_coverage_m2 not extracted")
         results["site_coverage_m2"] = {"status": "MISSING"}
     else:
+        logger.log(f"{'site_coverage_m2':<25}  expected={GT_COVERAGE_M2} m²", indent=1)
         delta  = abs(m2_extracted - GT_COVERAGE_M2)
         status = "PASS" if delta <= AREA_TOLERANCE else "FAIL"
         logger.log(f"  extracted={m2_extracted} m²  delta={delta:.3f}  → {status}", indent=2)
@@ -93,7 +104,10 @@ def check_coverage(areas: dict, flags: list) -> dict:
     site_val = (areas.get("site_area") or {}).get("value")
     if m2_extracted and site_val:
         computed_pct = round(m2_extracted / site_val * 100, 2)
-        stated_pct   = pct_extracted or GT_COVERAGE_PCT
+        stated_pct   = pct_extracted or GT_COVERAGE_PCT  # may be None if both unknown
+        if stated_pct is None:
+            results["internal_consistency"] = {"computed_pct": computed_pct, "status": "SKIP"}
+            return results
         internal_delta = abs(computed_pct - stated_pct)
         consistent = internal_delta <= COVERAGE_TOLERANCE
         logger.log(
@@ -114,6 +128,10 @@ def check_coverage(areas: dict, flags: list) -> dict:
 
 
 def check_room_completeness(rooms_data: dict, flags: list) -> dict:
+    if not GT_EXPECTED_ROOMS:
+        logger.log("GT_EXPECTED_ROOMS empty — skipping room completeness check", indent=1)
+        return {"status": "SKIP"}
+
     centroids = rooms_data.get("room_centroids", [])
     found: dict[str, int] = {}
     for c in centroids:
@@ -268,7 +286,10 @@ def main(areas_data: dict, rooms_data: dict, geometry_data: dict, output_dir: Pa
 
     logger.section("Area cross-validation: schedule vs lighting calc (A220)")
     gf_val = (areas.get("ground_floor") or {}).get("value")
-    if gf_val is not None:
+    if GT_LIGHTING_DWELLING is None:
+        logger.log("No GT_LIGHTING_DWELLING — skipping A220 cross-check")
+        checks["area_cross_check"] = {"status": "SKIP"}
+    elif gf_val is not None:
         delta_lighting = abs(gf_val - GT_LIGHTING_DWELLING)
         status         = "within_tolerance" if delta_lighting <= AREA_DELTA_FLAG_M2 else "FLAG_discrepancy"
         logger.log(f"Schedule dwelling: {gf_val}  lighting calc: {GT_LIGHTING_DWELLING}  delta: {delta_lighting:.2f} m²")

@@ -28,38 +28,22 @@ PAGE_RCP            = 7   # A220
 # Scale: 1:100, A3 paper, 1pt = 25.4/72 mm on paper
 MM_PER_PT = (25.4 / 72) * 100   # = 35.2778 mm real-world per PDF point
 
-# Ground truth for validation
-GT_SITE_AREA     = 527.14
-GT_DWELLING      = 198.07
-GT_PORCH         = 3.06
-GT_OUTDOOR       = 27.18
-GT_COVERAGE_PCT  = 41.72
-GT_COVERAGE_M2   = 219.91
-GT_OVERALL_MM    = 20490
+# Ground truth for validation — set to None when unknown; checks are skipped for None values
+GT_SITE_AREA     = None
+GT_DWELLING      = None
+GT_PORCH         = None
+GT_OUTDOOR       = None
+GT_COVERAGE_PCT  = None
+GT_COVERAGE_M2   = None
+GT_OVERALL_MM    = None   # plan overall length used for calibration; None → use largest dim string
 
-# Cross-validation source (lighting calc, A220) — excludes some areas so delta ~10 m² expected
-GT_LIGHTING_DWELLING = 188.48
-GT_LIGHTING_PORCH    = 1.98
-GT_LIGHTING_OUTDOOR  = 26.57
+# Cross-validation source (A220 lighting calc) — None when unknown
+GT_LIGHTING_DWELLING = None
+GT_LIGHTING_PORCH    = None
+GT_LIGHTING_OUTDOOR  = None
 
 CALIBRATION_ERROR_THRESHOLD = 0.05   # 5%
 AREA_DELTA_FLAG_M2           = 20.0   # flag if dwelling delta > this
 
-# Expected rooms on A201 — type: minimum required count
-GT_EXPECTED_ROOMS = {
-    "bedroom":      3,
-    "wir":          1,
-    "ensuite":      1,
-    "bathroom":     1,
-    "powder_room":  1,
-    "laundry":      1,
-    "living":       1,
-    "kitchen":      1,
-    "dining":       1,
-    "sitting":      1,
-    "entry":        1,
-    "porch":        1,
-    "study":        1,
-    "pantry":       1,
-    "outdoor_living": 1,
-}
+# Expected rooms — empty dict skips the room-completeness check
+GT_EXPECTED_ROOMS = {}
