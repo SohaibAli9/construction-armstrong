@@ -62,12 +62,14 @@ Validate extraction against these known values:
 
 ## Algorithm notes
 
-1. `page.get_text()` → classify all 30 pages by drawing title
+1. `page.get_text()` → classify all 30 pages by drawing title (Flash only — regex unreliable on spec-heavy docs)
 2. A100 → two-pass line-by-line parser → AREA ANALYSIS table (multi-column flattening)
 3. A201 → `get_text("dict")` → room labels + bbox centroids; size filter ≥ 8.5pt drops legend noise
 4. A201 → `get_drawings()` → Filter D: single-segment dark paths, width ≥ 0.45pt, extent ≥ 15pt; 40pt margin excludes title block; colinear merge across gaps < 25pt
 5. Calibration: Flash locates actual dimension line near "20490"; computes `computed_mm_per_pt` vs nominal 35.28
 6. SVG: wall lines if ≥ 20 walls pass span check (0.3×–1.3× of 20490 mm); fallback to centroid boxes
+
+**Classification classes:** `proposed_plan_primary` = GF plan; `proposed_plan_ff` = upper floor (multi-storey); `site_plan` = proposed site plan with AREA ANALYSIS; `existing_plan` covers existing floor plans AND existing site plans. Stages 2–4 currently only consume `proposed_plan_primary` and `site_plan` — `proposed_plan_ff` is classified correctly but not yet processed downstream.
 
 **Scale:** `real_mm = pdf_pts × 35.28`; PDF Y is inverted: `real_y = (page_height_pts − pdf_y) × 35.28`.  
 Nominal: `MM_PER_PT = (25.4 / 72) × 100 = 35.2778`.

@@ -15,9 +15,9 @@ DEEPSEEK_FLASH_OUTPUT_COST = 0.28 / 1_000_000
 
 ROOT       = Path(__file__).parent
 SAMPLE_DIR = ROOT.parent / "sample"
-OUTPUT_DIR = ROOT.parent / "output"
 
-PDF_PATH = SAMPLE_DIR / "Mesh Reservoir 620k mid.pdf"
+PDF_PATH   = SAMPLE_DIR / "DMP Elm Northcote 750k.pdf"
+OUTPUT_DIR = ROOT.parent / "output" / PDF_PATH.stem
 
 # Known page indices (0-based) — confirmed from document
 PAGE_SITE_PLAN      = 2   # A100

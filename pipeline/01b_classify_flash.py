@@ -33,6 +33,7 @@ VALID_CLASSES = {
     "site_plan",
     "existing_plan",
     "proposed_plan_primary",
+    "proposed_plan_ff",
     "proposed_plan_supplementary",
     "electrical_plan",
     "rcp",
@@ -58,7 +59,7 @@ def load_prompt() -> str:
         logger.log(f"Loaded prompt: {path}  ({len(_system_prompt)} chars)")
     return _system_prompt
 
-DRAWING_NO_RE = re.compile(r'\b([A-Z]\s*\d{3}[a-zA-Z]?)\b')
+DRAWING_NO_RE = re.compile(r'\b([A-Z][ \t]*\d{3}[a-zA-Z]?)\b')
 SCALE_RE      = re.compile(r'1\s*[:/]\s*(\d+)')
 DATE_RE       = re.compile(r'\b(\d{1,2}/\d{2}/\d{2,4})\b')
 
@@ -239,9 +240,14 @@ def main(pdf_path: Path, output_dir: Path) -> list[dict]:
 
     # Sanity checks
     primary_count = sum(1 for p in final_pages if p["classification"] == "proposed_plan_primary")
+    ff_count      = sum(1 for p in final_pages if p["classification"] == "proposed_plan_ff")
     site_count    = sum(1 for p in final_pages if p["classification"] == "site_plan")
-    if primary_count != 1:
-        logger.warn(f"Expected exactly 1 proposed_plan_primary, got {primary_count}")
+    if primary_count == 0:
+        logger.warn("No proposed_plan_primary found — room/geometry extraction will fail")
+    elif primary_count > 1:
+        logger.warn(f"Multiple proposed_plan_primary ({primary_count}) — expected 1 GF plan")
+    if ff_count > 0:
+        logger.log(f"Multi-storey set: {ff_count} first-floor plan(s) found (proposed_plan_ff)")
     if site_count == 0:
         logger.warn("No site_plan found — area extraction will fail")
 

@@ -5,10 +5,11 @@ containing a drawing title, drawing number (e.g. A100, A201), scale, and date.
 CLASSES (use exactly these strings):
   title_sheet                — cover / project info page
   general_notes              — written notes, specifications, legends
-  site_plan                  — site plan showing block, setbacks; may include AREA ANALYSIS table
-  existing_plan              — existing or demolition floor plan
-  proposed_plan_primary      — the MAIN proposed floor plan (highest drawing number, e.g. A201)
-  proposed_plan_supplementary — secondary proposed plan context sheet (e.g. A200 with landscaping)
+  site_plan                  — PROPOSED site plan with AREA ANALYSIS table or proposed setbacks
+  existing_plan              — existing conditions plan, demolition plan, OR existing site plan (pre-works)
+  proposed_plan_primary      — proposed GROUND FLOOR plan with room labels, dimensions, scale 1:100
+  proposed_plan_ff           — proposed FIRST FLOOR (upper floor) plan in a multi-storey dwelling
+  proposed_plan_supplementary — secondary context sheet (e.g. landscaping overlay, no room labels)
   rcp                        — Reflected Ceiling Plan or lighting layout
   roof_plan                  — roof plan only
   electrical_plan            — electrical / power / data plan
@@ -22,13 +23,16 @@ CLASSES (use exactly these strings):
   irrelevant                 — anything not fitting above
 
 RULES:
-- There is exactly ONE proposed_plan_primary — the floor plan with room labels, dimensions, and scale 1:100.
-  If two pages are both "Proposed Plan", the one with drawing number A201 (or highest) is primary;
-  the other is supplementary.
-- A page with "AREA ANALYSIS" table is site_plan even if titled differently.
+- proposed_plan_primary is the GROUND FLOOR proposed plan (room labels, dimensions, scale 1:100).
+  For single-storey sets there is exactly one. For multi-storey sets the ground floor is primary;
+  use proposed_plan_ff for each upper-floor plan.
+- proposed_plan_supplementary is for secondary sheets that lack room labels and full dimensions
+  (e.g. a context or landscaping overlay). Do NOT use it for a floor plan with rooms.
+- site_plan is the PROPOSED site plan — typically includes the AREA ANALYSIS table or proposed
+  setbacks. An existing/pre-works site plan belongs in existing_plan, not site_plan.
+- A page with "AREA ANALYSIS" table is always site_plan regardless of its title.
 - A page whose title contains "Shadow" or "Shadows" (e.g. "Shadows - 9am", "Shadows - 3pm"), or whose
-  drawing number is in the A800–A899 range, is shadow_diagram — NOT site_plan. These pages show sun
-  shadow projections overlaid on a site context view.
+  drawing number is in the A800–A899 range, is shadow_diagram — NOT site_plan.
 - The drawing number is found in the title block (bottom or right edge of the page), adjacent to the
   architect name, project name, date, and "Issue for Construction" text. Do NOT use section reference
   bubbles (e.g. "1 / A500" appearing mid-page in the drawing body) as the drawing number — those are
