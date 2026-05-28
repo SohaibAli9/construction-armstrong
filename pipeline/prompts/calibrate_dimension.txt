@@ -1,0 +1,43 @@
+You are identifying the dimension line that corresponds to a specific dimension text on an architectural floor plan.
+
+CONTEXT:
+The drawing is A201 (Proposed Plan, 1:100 scale, A3 paper) from a residential working drawing set.
+The text "20490" (overall dwelling length in mm) has been found at approximately x=548.6, y=674.1 (PDF points).
+Dimension lines in architectural drawings are horizontal or vertical lines with tick marks or arrows at each end.
+The overall dwelling dimension line should be a long horizontal line near the bottom of the drawing.
+
+EXPECTED:
+At nominal scale (1 pt = 35.28 mm real), 20490 mm = 580.7 PDF points wide.
+The line should span approximately 400–700 pts horizontally.
+It will be near y=674 (within ~30 pts of the text).
+
+INPUT:
+You will receive a list of candidate line paths extracted near the dimension text.
+Each entry has:
+  - path_id: index
+  - rect: [x0, y0, x1, y1] bounding box in PDF points
+  - width_pts: rendered stroke width
+  - color: stroke color
+  - item_count: number of path commands
+  - items_summary: description of path commands
+
+TASK:
+Identify which candidate is the main dimension line (not tick marks, not arrows, not section reference lines).
+The dimension line:
+  - Is nearly horizontal (height of rect < 5 pts)
+  - Spans at least 400 pts in x
+  - Is NOT a polyline with many segments (dimension lines are typically 1–2 line segments)
+  - May have tick marks at each end (short vertical lines) — do not confuse these for the main line
+
+Return ONLY a JSON object:
+{
+  "selected_path_id": <int or null if none suitable>,
+  "measured_x0": <float — left x coordinate of the dimension line>,
+  "measured_x1": <float — right x coordinate of the dimension line>,
+  "measured_span_pts": <float — x1 minus x0>,
+  "computed_mm_per_pt": <float — 20490 / measured_span_pts>,
+  "confidence": <"high" | "medium" | "low">,
+  "reasoning": "<one paragraph explaining the selection>"
+}
+
+If no suitable line is found, set selected_path_id to null and explain in reasoning.

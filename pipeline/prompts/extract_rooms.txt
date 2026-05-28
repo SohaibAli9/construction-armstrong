@@ -1,0 +1,59 @@
+You are extracting room inventory from an Australian residential architectural floor plan (A201 — Proposed Plan).
+
+The input is a list of text spans extracted by PyMuPDF from the vector PDF. Each span has:
+  - label: the text string
+  - x_pt, y_pt: centroid position in PDF points (origin top-left)
+  - size: rendered font size in points
+
+KEY INSIGHT — the page has two layers of text at different font sizes:
+  ~9.5–10.5 pt  → real room labels inside the drawing (these are canonical)
+  ~6.5–7.5 pt   → legend rows, revision schedule, title block annotations (these are duplicates to ignore)
+
+Your job is to identify exactly ONE canonical label per room space and return a clean room inventory.
+
+EXPECTED ROOMS for this specific dwelling (58 Locksley Avenue, Reservoir VIC):
+  Bed 01, Bed 02, Bed 03, WIR, ENS (ensuite), Bath, Pdr (powder room),
+  Ldy (laundry), Living, Kitchen, Dining, Sitting, Entry, Porch,
+  Study, Pty (pantry), Outdoor Living
+
+RULES:
+- If the same room type appears at both ~7pt and ~10pt, the ~10pt version is canonical.
+- Combined labels like "KITCHEN / LIVING / DINING", "BED 01 / STORE", "ENS / BATH" appear in
+  the legend/annotation zone (small font, near page edges) — do NOT count them as rooms.
+- "OUTDOOR LIVING" at ~7pt near the right edge is a legend entry — the canonical outdoor living
+  label will be at ~10pt inside the plan body.
+- "PROPOSED SHED," "AMENDED KITCHEN..." etc. are revision notes — ignore.
+- Count each distinct room space exactly once.
+- For bedrooms, extract the specific labels (Bed 01, Bed 02, Bed 03).
+
+Return ONLY a JSON object. No markdown, no explanation outside the JSON.
+
+OUTPUT FORMAT:
+{
+  "rooms": {
+    "bedrooms":      { "count": <int>, "labels": ["Bed 01", "Bed 02", "Bed 03"] },
+    "ensuite":       { "count": <int> },
+    "bathroom":      { "count": <int> },
+    "powder_room":   { "count": <int> },
+    "kitchen":       { "count": <int> },
+    "laundry":       { "count": <int> },
+    "wir":           { "count": <int> },
+    "pantry":        { "count": <int> },
+    "study":         { "count": <int> },
+    "living":        { "count": <int> },
+    "dining":        { "count": <int> },
+    "sitting":       { "count": <int> }
+  },
+  "canonical_centroids": [
+    {
+      "label": "<room label text>",
+      "type": "<room_type>",
+      "x_pt": <float>,
+      "y_pt": <float>,
+      "size": <float>,
+      "reasoning": "<why this is the canonical instance>"
+    }
+  ],
+  "ignored_spans": ["<label> (reason)"],
+  "overall_reasoning": "<one paragraph explaining how you resolved duplicates>"
+}

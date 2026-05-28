@@ -1,0 +1,54 @@
+You are extracting area data from an Australian residential architectural drawing.
+The input is the raw text of a Site Plan / Area Analysis page (A100) extracted by PyMuPDF.
+
+IMPORTANT: PyMuPDF flattens multi-column tables by reading each column top-to-bottom before
+moving to the next. This means you will see all row labels first, then all values — they are
+NOT adjacent. Match them by their document order (first label → first value, etc.).
+
+EXTRACT these fields (all in m², coverage also as %):
+  site_area           — total site/lot area
+  ground_floor        — proposed dwelling floor area (labelled "PROPOSED DWELLING" or "DWELLING")
+  porch               — covered porch area
+  outdoor_living      — outdoor living / alfresco area
+  site_coverage_pct   — site coverage as a percentage
+  site_coverage_m2    — site coverage as m² (= dwelling + porch, often stated explicitly)
+
+KNOWN GROUND TRUTH for this document (use to sanity-check your extraction):
+  site_area = 527.14 m²
+  ground_floor = 198.07 m²
+  porch = 3.06 m²
+  outdoor_living = 27.18 m²
+  site_coverage_pct = 41.72%
+  site_coverage_m2 = 219.91 m²
+
+If an extracted value does not match the ground truth closely (within 1 m²), re-examine the
+text carefully before accepting it. Explain your reasoning step by step.
+
+Also extract project metadata if present in the text:
+  address    — street address (e.g. "58 Locksley Avenue, Reservoir VIC 3060")
+  client     — client/owner name
+  state      — Australian state abbreviation (VIC, NSW, etc.)
+  date       — document date (dd/mm/yy format)
+  status     — "issue_for_construction" or "planning_application"
+
+Return ONLY a JSON object. No markdown, no explanation outside the JSON.
+
+OUTPUT FORMAT:
+{
+  "areas": {
+    "site_area":         { "value": <float or null>, "reasoning": "<brief>" },
+    "ground_floor":      { "value": <float or null>, "reasoning": "<brief>" },
+    "porch":             { "value": <float or null>, "reasoning": "<brief>" },
+    "outdoor_living":    { "value": <float or null>, "reasoning": "<brief>" },
+    "site_coverage_pct": { "value": <float or null>, "reasoning": "<brief>" },
+    "site_coverage_m2":  { "value": <float or null>, "reasoning": "<brief>" }
+  },
+  "project": {
+    "address": "<string or null>",
+    "client":  "<string or null>",
+    "state":   "<string or null>",
+    "date":    "<string or null>",
+    "status":  "<string or null>"
+  },
+  "overall_reasoning": "<one paragraph explaining how you parsed the column layout>"
+}

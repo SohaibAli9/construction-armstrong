@@ -1,0 +1,19 @@
+# Generated outputs
+output/
+
+# PDF sample (binary, large)
+sample/
+
+# Python
+pipeline/.venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+
+# Environment / secrets
+pipeline/.env
+.env
+
+# OS
+.DS_Store

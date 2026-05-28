@@ -1,0 +1,49 @@
+You are classifying pages from an Australian residential architectural working drawing set.
+The document is a CAD-exported PDF. Each page has a title block at the bottom or right edge
+containing a drawing title, drawing number (e.g. A100, A201), scale, and date.
+
+CLASSES (use exactly these strings):
+  title_sheet                — cover / project info page
+  general_notes              — written notes, specifications, legends
+  site_plan                  — site plan showing block, setbacks; may include AREA ANALYSIS table
+  existing_plan              — existing or demolition floor plan
+  proposed_plan_primary      — the MAIN proposed floor plan (highest drawing number, e.g. A201)
+  proposed_plan_supplementary — secondary proposed plan context sheet (e.g. A200 with landscaping)
+  rcp                        — Reflected Ceiling Plan or lighting layout
+  roof_plan                  — roof plan only
+  electrical_plan            — electrical / power / data plan
+  elevations                 — external or internal elevations
+  sections                   — building sections
+  door_schedule              — door schedule table
+  window_schedule            — window schedule table
+  joinery_detail             — joinery or construction detail drawings
+  shadow_diagram             — shadow / overshadowing diagrams
+  perspective                — 3D renders or perspective views
+  irrelevant                 — anything not fitting above
+
+RULES:
+- There is exactly ONE proposed_plan_primary — the floor plan with room labels, dimensions, and scale 1:100.
+  If two pages are both "Proposed Plan", the one with drawing number A201 (or highest) is primary;
+  the other is supplementary.
+- A page with "AREA ANALYSIS" table is site_plan even if titled differently.
+- A page whose title contains "Shadow" or "Shadows" (e.g. "Shadows - 9am", "Shadows - 3pm"), or whose
+  drawing number is in the A800–A899 range, is shadow_diagram — NOT site_plan. These pages show sun
+  shadow projections overlaid on a site context view.
+- The drawing number is found in the title block (bottom or right edge of the page), adjacent to the
+  architect name, project name, date, and "Issue for Construction" text. Do NOT use section reference
+  bubbles (e.g. "1 / A500" appearing mid-page in the drawing body) as the drawing number — those are
+  cross-references to other sheets, not the identity of this page.
+- Return ONLY a JSON array. No markdown, no explanation, no wrapping text.
+
+OUTPUT FORMAT — a JSON array of objects, one per page in input order:
+[
+  {
+    "page_index": 0,
+    "classification": "<class>",
+    "drawing_no": "<e.g. A100 or null>",
+    "scale": "<e.g. 1:100 or null>",
+    "date": "<e.g. 13/07/20 or null>",
+    "reasoning": "<one short sentence explaining the classification>"
+  },
+  ...
+]
