@@ -17,7 +17,14 @@ CLASSES (use exactly these strings):
   sections                   — building sections
   door_schedule              — door schedule table
   window_schedule            — window schedule table
-  joinery_detail             — joinery or construction detail drawings
+  joinery_detail             — construction details, joinery elevations, and
+                               selection/specification sheets tied to a specific
+                               room or element named in the title (e.g. "KITCHEN
+                               INTERNAL ELEVATIONS", "BATHROOM SELECTIONS",
+                               "FENCING TO PROPERTY", "WINDOW SEAT DETAILS").
+                               Use for any detail sheet named after a specific
+                               element. Do NOT use for project-wide general
+                               specification sheets — those belong in general_notes.
   shadow_diagram             — shadow / overshadowing diagrams
   perspective                — 3D renders or perspective views
   irrelevant                 — anything not fitting above
@@ -31,12 +38,18 @@ RULES:
 - site_plan is the PROPOSED site plan — typically includes the AREA ANALYSIS table or proposed
   setbacks. An existing/pre-works site plan belongs in existing_plan, not site_plan.
 - A page with "AREA ANALYSIS" table is always site_plan regardless of its title.
+- A page whose title contains "WINDOW & DOOR SCHEDULE" (whether GF or FF) MUST be
+  classified as door_schedule. window_schedule is ONLY for pages that are exclusively
+  window schedules, not combined door-and-window schedules.
 - A page whose title contains "Shadow" or "Shadows" (e.g. "Shadows - 9am", "Shadows - 3pm"), or whose
   drawing number is in the A800–A899 range, is shadow_diagram — NOT site_plan.
 - The drawing number is found in the title block (bottom or right edge of the page), adjacent to the
   architect name, project name, date, and "Issue for Construction" text. Do NOT use section reference
   bubbles (e.g. "1 / A500" appearing mid-page in the drawing body) as the drawing number — those are
   cross-references to other sheets, not the identity of this page.
+  While most drawing numbers follow the A### standard (e.g. A100, A201), some projects use
+  page-number format like "05 of 47" or "Sheet 5". Use whatever unique identifier appears
+  adjacent to the project name / architect / date in the title block.
 - Return ONLY a JSON array. No markdown, no explanation, no wrapping text.
 
 OUTPUT FORMAT — a JSON array of objects, one per page in input order:

@@ -1,11 +1,11 @@
 """
-Stage 1b: LLM-assisted page classification via DeepSeek Flash.
+Stage 1: LLM-assisted page classification via DeepSeek Flash.
 
 Sends all page texts in a single call so the model has full document context
 (e.g. it can distinguish primary vs supplementary proposed plan, resolve
 ambiguous titles, and understand the overall drawing set structure).
 
-Output: output/classification_report_flash.json — same schema as 01_classify.py.
+Output: output/classification_report_flash.json.
 """
 
 import json
@@ -59,20 +59,45 @@ def load_prompt() -> str:
         logger.log(f"Loaded prompt: {path}  ({len(_system_prompt)} chars)")
     return _system_prompt
 
-DRAWING_NO_RE = re.compile(r'\b([A-Z][ \t]*\d{3}[a-zA-Z]?)\b')
-SCALE_RE      = re.compile(r'1\s*[:/]\s*(\d+)')
-DATE_RE       = re.compile(r'\b(\d{1,2}/\d{2}/\d{2,4})\b')
+# Standard Australian drawing discipline codes (AS 1100.301).
+# Single-letter prefixes like "X 100" from timber dimensions ("100 X 100") are NOT
+# valid drawing numbers — restricting to known discipline codes eliminates those.
+DISCIPLINE_CODES = 'ACDEFHLMPS'
+DRAWING_NO_RE = re.compile(rf'\b([{DISCIPLINE_CODES}])[ \t]*\d{{3}}[a-zA-Z]?\b')
+
+# Common architectural scales used in Australian residential drawings.
+# Minimum 1:5 — excludes ratio text like "1:1" or "1:3" found in specifications.
+# Includes the full practical range: 1:5 up to 1:500 for site plans.
+VALID_SCALE_DENOMS = {5, 10, 20, 25, 50, 100, 200, 250, 500}
+SCALE_RE = re.compile(r'1\s*[:/]\s*(\d+)\b')
+
+DATE_RE = re.compile(r'\b(\d{1,2}/\d{2}/\d{2,4})\b')
 
 
 def extract_meta_fallback(text: str) -> dict:
-    """Regex fallback for drawing_no / scale / date if LLM returns nulls."""
+    """Regex fallback for drawing_no / scale / date if LLM returns nulls.
+
+    Uses domain-constrained patterns validated against known Australian
+    residential drawing conventions to avoid false positives from
+    specification text, dimensions, and ratios in the drawing body.
+    """
     dn_m    = DRAWING_NO_RE.search(text)
-    scale_m = SCALE_RE.search(text)
     date_m  = DATE_RE.search(text)
+
+    # Scale: validate denominator against common architectural scales
+    scale = None
+    for m in SCALE_RE.finditer(text):
+        denom = int(m.group(1))
+        if denom in VALID_SCALE_DENOMS:
+            scale = f"1:{denom}"
+            # Prefer the last valid match (title block is at end of page text)
+            # Keep iterating to find later matches
+            continue
+
     return {
-        "drawing_no": dn_m.group(0)         if dn_m    else None,
-        "scale":      f"1:{scale_m.group(1)}" if scale_m else None,
-        "date":       date_m.group(1)        if date_m  else None,
+        "drawing_no": dn_m.group(0)       if dn_m    else None,
+        "scale":      scale               if scale   else None,
+        "date":       date_m.group(1)     if date_m  else None,
     }
 
 
@@ -109,7 +134,7 @@ def call_flash(user_message: str) -> tuple[list, float]:
                     {"role": "system", "content": load_prompt()},
                     {"role": "user",   "content": user_message},
                 ],
-                max_tokens=4096,
+                max_tokens=16384,
                 temperature=0,
             )
             raw = resp.choices[0].message.content.strip()
@@ -201,8 +226,8 @@ def diff_vs_regex(flash_pages: list[dict], regex_path: Path) -> None:
         logger.log(f"  {diffs} page(s) differ", indent=1)
 
 
-def main(pdf_path: Path, output_dir: Path) -> list[dict]:
-    logger.init(output_dir, "01b_classify_flash")
+def main(pdf_path: Path, output_dir: Path) -> tuple[list[dict], float]:
+    logger.init(output_dir, "01_classification")
     logger.log(f"PDF: {pdf_path}")
 
     doc = fitz.open(str(pdf_path))
@@ -263,13 +288,14 @@ def main(pdf_path: Path, output_dir: Path) -> list[dict]:
 
     logger.log(f"Total cost: ${cost:.4f}")
 
+    result = {"pages": final_pages, "cost_usd": round(cost, 5)}
     out = output_dir / "classification_report_flash.json"
-    out.write_text(json.dumps(final_pages, indent=2))
+    out.write_text(json.dumps(result, indent=2))
     logger.log(f"Written: {out}")
-    return final_pages
+    return final_pages, cost
 
 
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    result = main(PDF_PATH, OUTPUT_DIR)
-    print(f"\nDone. {len(result)} pages classified.")
+    result, cost = main(PDF_PATH, OUTPUT_DIR)
+    print(f"\nDone. {len(result)} pages classified. Cost: ${cost:.4f}")

@@ -19,6 +19,7 @@ Calibration:
 """
 
 import json
+import math
 import re
 import time
 import fitz
@@ -75,6 +76,140 @@ def aspect_ratio(rect) -> float:
     w = abs(rect[2] - rect[0])
     h = abs(rect[3] - rect[1])
     return w / h if h > 0 else 999.0
+
+
+def compute_extent_threshold(dark_wide_l1: list[dict]) -> float:
+    """
+    Pick extent threshold by finding the largest gap in the distribution
+    of extents for dark l×1 paths (width ≥ 0.45pt).
+
+    Mesh-style: wall extents cluster at 30-100pt, annotations at < 8pt,
+    gap at ~22pt → threshold ~15pt filters ticks cleanly.
+
+    DMP-style: wall segments are short and fragmented, extents < 12pt
+    with no clear gap → threshold drops to 8pt to keep structural segments.
+    """
+    extents = sorted(rect_max_extent(d["rect"]) for d in dark_wide_l1)
+    if len(extents) < 5:
+        return 15.0
+
+    # Use 85th percentile + 2pt margin as the threshold.
+    # This separates the annotation cluster (short extents, the bulk of paths)
+    # from the structural cluster (longer extents, the tail).
+    # Floor at 8pt (never drop all segments on fragmented PDFs).
+    # Ceiling at 15pt (Mesh-style — filters tick marks ~5pt cleanly).
+    p85_idx = int(len(extents) * 0.85)
+    p85 = extents[min(p85_idx, len(extents) - 1)]
+    p50 = extents[len(extents) // 2]
+    p95 = extents[min(int(len(extents) * 0.95), len(extents) - 1)]
+    logger.log(f"Extent distribution: p50={p50:.1f}  p85={p85:.1f}  p95={p95:.1f}  "
+               f"paths={len(extents)}")
+
+    thr = max(8.0, min(p85 + 2.0, 15.0))
+    logger.log(f"Adaptive extent threshold: {thr:.1f}pt (p85={p85:.1f} + 2pt, capped to [8, 15])")
+    return thr
+
+
+def compute_width_threshold(drawings: list[dict]) -> float:
+    """
+    Find the smallest stroke width in the structural cluster (above 0.3pt)
+    and set the threshold just below it.
+
+    Mesh: annotations at 0.24pt, walls start at 0.48pt → threshold 0.45pt
+    DMP:  annotations at 0.28pt, walls start at 0.52pt → threshold 0.49pt
+
+    This reliably captures the annotation-wall gap without being confused
+    by large gaps within the wall cluster (e.g. between 0.60pt and 0.96pt).
+    """
+    widths = sorted(
+        d.get("width", 0) for d in drawings
+        if is_dark(d.get("color")) and 0.2 <= (d.get("width") or 0) <= 1.5
+    )
+    if len(widths) < 10:
+        return 0.45
+
+    # Bucket at 0.04pt resolution — annotations sit below 0.3pt,
+    # structural elements start at ≥ 0.48pt with a clean gap.
+    wall_bins = sorted({round(w * 25) / 25 for w in widths if w >= 0.3})
+    if not wall_bins:
+        return 0.45
+
+    # First bin ≥ 0.3 is the start of the structural cluster.
+    # Set threshold just below it so we capture everything structural.
+    threshold = max(0.35, round(wall_bins[0] - 0.03, 2))
+    logger.log(f"Adaptive width threshold: {threshold:.2f}pt  "
+               f"(first_wall_bin={wall_bins[0]:.2f}pt  wall_bins={len(wall_bins)})")
+    return threshold
+
+
+def decompose_path(items: list) -> list[dict]:
+    """
+    Decompose a path's drawing commands into individual line segments.
+    Handles 'm' (move-to) and 'l' (line-to) commands.
+    Returns list of {x0, y0, x1, y1} dicts.
+    """
+    segments = []
+    cur_x, cur_y = 0.0, 0.0
+    for item in items:
+        cmd = item[0]
+        if cmd == "m":
+            cur_x, cur_y = float(item[1]), float(item[2])
+        elif cmd == "l":
+            end_x, end_y = float(item[1]), float(item[2])
+            dx = end_x - cur_x
+            dy = end_y - cur_y
+            if math.hypot(dx, dy) > 0.5:  # skip zero-length segments
+                segments.append({"x0": cur_x, "y0": cur_y, "x1": end_x, "y1": end_y})
+            cur_x, cur_y = end_x, end_y
+    return segments
+
+
+def extract_multi_segment(drawings: list[dict], plan_bounds: dict | None,
+                          width_min: float = 0.45) -> list[dict]:
+    """
+    Extract wall segments from multi-segment dark polylines (Filter E).
+
+    DMP-style CAD exports walls as connected short l-segments (polylines)
+    rather than single long strokes. This filter decomposes those into
+    individual segments so the colinear merge can reassemble them.
+
+    Returns segments in the same format as Filter D candidates.
+    """
+    segments = []
+    for d in drawings:
+        items = d.get("items", [])
+        if len(items) < 2:
+            continue
+        if not is_dark(d.get("color")):
+            continue
+        if (d.get("width") or 0) < width_min:
+            continue
+        # Only paths where all drawing commands are l/m (lines, not curves)
+        if any(item[0] not in ("l", "m") for item in items):
+            continue
+        l_count = sum(1 for item in items if item[0] == "l")
+        if l_count < 2:
+            continue
+
+        decomposed = decompose_path(items)
+        total_len = sum(math.hypot(s["x1"] - s["x0"], s["y1"] - s["y0"]) for s in decomposed)
+        if total_len < 15.0:
+            continue
+
+        for s in decomposed:
+            x0, y0 = s["x0"], s["y0"]
+            x1, y1 = s["x1"], s["y1"]
+            rect = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            if plan_bounds and not within_bounds(rect, plan_bounds):
+                continue
+            segments.append({
+                "rect":  rect,
+                "width": d.get("width", 0.48),
+                "color": d.get("color"),
+            })
+
+    logger.log(f"Filter E (multi-segment polylines): {len(segments)} segments")
+    return segments
 
 
 def items_summary(items: list) -> str:
@@ -165,17 +300,27 @@ def extract_walls(drawings: list[dict], plan_bounds: dict | None) -> tuple[list[
     logger.log(f"Filter B (dark stroke + ≥4 items + extent>30pt): {len(filter_b)}")
     steps.update({"filter_a": len(filter_a), "filter_b": len(filter_b)})
 
-    # ── Filter D: l×1 single segments (the actual walls) ─────────────────────
+    # ── Adaptive width threshold ──────────────────────────────────────────────
+    width_min = compute_width_threshold(drawings)
+    steps["width_threshold_pt"] = width_min
+
+    logger.log(f"Width threshold: {width_min:.2f}pt  (used by Filter D and E)")
+
+    # ── Filter D: l×1 single segments ────────────────────────────────────────
     logger.section("Filter D: l×1 single-segment walls")
 
-    d_step1 = [
+    # Unfiltered dark wide l×1 paths (width check only, no extent filter yet)
+    dark_wide_l1 = [
         d for d in drawings
         if len(d.get("items", [])) == 1 and d["items"][0][0] == "l"
         and is_dark(d.get("color"))
-        and (d.get("width") or 0) >= 0.45      # 0.24pt = annotations, 0.48pt+ = walls
-        and rect_max_extent(d["rect"]) >= 15    # eliminates tick marks
+        and (d.get("width") or 0) >= width_min
     ]
-    logger.log(f"  l×1 + dark + width≥0.45 + extent≥15pt: {len(d_step1)}")
+    extent_thr = compute_extent_threshold(dark_wide_l1)
+    steps["extent_threshold_pt"] = extent_thr
+
+    d_step1 = [d for d in dark_wide_l1 if rect_max_extent(d["rect"]) >= extent_thr]
+    logger.log(f"  l×1 + dark + width≥{width_min:.2f} + extent≥{extent_thr:.0f}pt: {len(d_step1)}")
     steps["filter_d_pre_bounds"] = len(d_step1)
 
     if plan_bounds:
@@ -186,16 +331,26 @@ def extract_walls(drawings: list[dict], plan_bounds: dict | None) -> tuple[list[
         logger.warn("  No plan bounds — skipping spatial clip")
     steps["filter_d_post_bounds"] = len(d_step2)
 
-    # Log width breakdown of surviving D candidates
+    # ── Filter E: multi-segment polylines ────────────────────────────────────
+    logger.section("Filter E: multi-segment dark polylines")
+    filter_e = extract_multi_segment(drawings, plan_bounds, width_min=width_min)
+
+    # ── Combine D + E ────────────────────────────────────────────────────────
+    combined = d_step2 + filter_e
+    logger.log(f"Combined D+E candidates: {len(combined)}  (D={len(d_step2)}  E={len(filter_e)})")
+    steps["filter_e"] = len(filter_e)
+    steps["combined_d_e"] = len(combined)
+
+    # Log width breakdown of surviving candidates
     w_counts: dict[str, int] = {}
-    for d in d_step2:
+    for d in combined:
         wk = f"{d.get('width') or 0:.2f}pt"
         w_counts[wk] = w_counts.get(wk, 0) + 1
     logger.log(f"  Width breakdown: {dict(sorted(w_counts.items()))}")
 
     # Log sample
-    logger.section("Filter D sample (first 8)")
-    for i, d in enumerate(d_step2[:8]):
+    logger.section("Wall candidate sample (first 8)")
+    for i, d in enumerate(combined[:8]):
         r = d["rect"]
         logger.log(
             f"  [{i}]  color={d.get('color')}  w={d.get('width')}  "
@@ -204,21 +359,19 @@ def extract_walls(drawings: list[dict], plan_bounds: dict | None) -> tuple[list[
             indent=1,
         )
 
-    steps["filter_d_final"] = len(d_step2)
-
-    # ── Choose: prefer D if it has enough walls, else fall back to A+B ────────
-    if len(d_step2) >= 20:
-        logger.log(f"Using Filter D ({len(d_step2)} segments)")
-        chosen = d_step2
-        wall_source = "filter_d_line_segments"
+    # ── Choose wall source ───────────────────────────────────────────────────
+    if len(combined) >= 20:
+        logger.log(f"Using D+E combined ({len(combined)} segments)")
+        chosen = combined
+        wall_source = "filter_d_plus_e"
     else:
         ab = list({id(d): d for d in filter_a + filter_b}.values())
         if len(ab) >= 20:
-            logger.log(f"Filter D insufficient — using A+B ({len(ab)} polygons)")
+            logger.log(f"D+E insufficient — using A+B ({len(ab)} polygons)")
             chosen = ab
             wall_source = "filter_ab_polygons"
         else:
-            best = max([(d_step2, "d"), (filter_a, "a"), (filter_b, "b")], key=lambda x: len(x[0]))
+            best = max([(combined, "de"), (filter_a, "a"), (filter_b, "b")], key=lambda x: len(x[0]))
             chosen, wall_source = best[0], f"best_available_{best[1]}"
             logger.warn(f"No filter hit ≥20 — best: {wall_source} ({len(chosen)})")
 
@@ -239,12 +392,13 @@ def merge_colinear(segments: list[dict], gap_tol_pt: float = 25.0) -> list[dict]
     if not segments:
         return []
 
-    H_TOL = 1.5   # pts: rect height must be < this to be horizontal
-    V_TOL = 1.5   # pts: rect width must be < this to be vertical
+    H_TOL = 3.0   # pts: rect height must be < this to be horizontal
+    V_TOL = 3.0   # pts: rect width must be < this to be vertical
+    ANGLE_TOL = 15  # degrees: max slope deviation for a diagonal group
 
     horiz: list[dict] = []
     vert:  list[dict] = []
-    other: list[dict] = []
+    diag:  list[tuple[dict, float]] = []  # (segment, angle_from_horizontal_degrees)
 
     for d in segments:
         r = d["rect"]
@@ -255,9 +409,19 @@ def merge_colinear(segments: list[dict], gap_tol_pt: float = 25.0) -> list[dict]
         elif w <= V_TOL:
             vert.append(d)
         else:
-            other.append(d)
+            # Compute angle from horizontal (0° = horizontal, 90° = vertical)
+            dx = r[2] - r[0]
+            dy = r[3] - r[1]
+            angle = abs(math.degrees(math.atan2(dy, dx))) if abs(dx) > 0.001 else 90.0
+            # Snap near-horizontal / near-vertical
+            if angle < ANGLE_TOL or angle > 180 - ANGLE_TOL:
+                horiz.append(d)
+            elif 90 - ANGLE_TOL < angle < 90 + ANGLE_TOL:
+                vert.append(d)
+            else:
+                diag.append((d, angle))
 
-    logger.log(f"Colinear merge input: {len(horiz)} horizontal  {len(vert)} vertical  {len(other)} diagonal/other")
+    logger.log(f"Colinear merge input: {len(horiz)} horizontal  {len(vert)} vertical  {len(diag)} diagonal")
 
     def merge_axis(segs: list[dict], axis: str) -> list[dict]:
         """
@@ -337,10 +501,75 @@ def merge_colinear(segments: list[dict], gap_tol_pt: float = 25.0) -> list[dict]
                 })
         return merged
 
+    # ── Diagonal merge ────────────────────────────────────────────────────────
+    def merge_diagonal(diag_segs: list[tuple[dict, float]]) -> list[dict]:
+        """
+        Group diagonal segments by angle and perpendicular position, merge into
+        walls using ACTUAL segment endpoint extremes — not computed midpoints.
+
+        Using midpoint+angle (old approach) produced phantom coordinates that
+        drifted outside the page boundary. Taking min/max of actual segment
+        endpoints guarantees the wall lies within the segment boundaries.
+        """
+        if not diag_segs:
+            return []
+        # Bucket by angle (15° resolution)
+        angle_buckets: dict[int, list] = defaultdict(list)
+        for d, angle in diag_segs:
+            key = round(angle / 15) * 15
+            angle_buckets[key].append(d)
+
+        merged = []
+        for angle, group in angle_buckets.items():
+            rad = math.radians(angle)
+            stroke_w = max((d.get("width") or 0.48) for d in group)
+            # Group by perpendicular projection of midpoint
+            perp_buckets: dict[int, list] = defaultdict(list)
+            for d in group:
+                r = d["rect"]
+                cx = (r[0] + r[2]) / 2
+                cy = (r[1] + r[3]) / 2
+                proj = cx * math.sin(rad) - cy * math.cos(rad)
+                key = round(proj)
+                perp_buckets[key].append(d)
+
+            for _, perp_group in perp_buckets.items():
+                # Use actual endpoint extremes across all segments in this group
+                all_x = []
+                all_y = []
+                for d in perp_group:
+                    r = d["rect"]
+                    all_x.extend([r[0], r[2]])
+                    all_y.extend([r[1], r[3]])
+
+                x0, x1 = min(all_x), max(all_x)
+                y0, y1 = min(all_y), max(all_y)
+                length = math.hypot(x1 - x0, y1 - y0)
+
+                if length < 8.0:  # skip sub-minimal walls
+                    continue
+
+                merged.append({
+                    "x0_pt": round(x0, 2),
+                    "y0_pt": round(y0, 2),
+                    "x1_pt": round(x1, 2),
+                    "y1_pt": round(y1, 2),
+                    "stroke_w_pt": stroke_w,
+                    "orientation": f"diagonal_{angle}deg",
+                    "length_pt": round(length, 1),
+                    "segment_count": len(perp_group),
+                })
+        return merged
+
     merged_h = merge_axis(horiz, "h")
     merged_v = merge_axis(vert, "v")
+    merged_d = merge_diagonal(diag)
 
-    logger.log(f"After merge: {len(merged_h)} horizontal walls  {len(merged_v)} vertical walls")
+    logger.log(f"After merge: {len(merged_h)} horizontal  {len(merged_v)} vertical  {len(merged_d)} diagonal")
+    if merged_d:
+        lengths_d = sorted(w["length_pt"] for w in merged_d)
+        logger.log(f"  Diagonal lengths (pts): min={lengths_d[0]:.0f}  "
+                   f"median={lengths_d[len(lengths_d)//2]:.0f}  max={lengths_d[-1]:.0f}")
     if merged_h:
         lengths_h = sorted(w["length_pt"] for w in merged_h)
         logger.log(f"  Horizontal lengths (pts): min={lengths_h[0]:.0f}  "
@@ -350,7 +579,7 @@ def merge_colinear(segments: list[dict], gap_tol_pt: float = 25.0) -> list[dict]
         logger.log(f"  Vertical lengths (pts):   min={lengths_v[0]:.0f}  "
                    f"median={lengths_v[len(lengths_v)//2]:.0f}  max={lengths_v[-1]:.0f}")
 
-    return merged_h + merged_v
+    return merged_h + merged_v + merged_d
 
 
 # ─── Coordinate conversion ────────────────────────────────────────────────────
@@ -550,6 +779,7 @@ def _nominal_calibration(method: str = "nominal", reasoning: str = "") -> dict:
         "error_pct":          None,
         "flag":               False,
         "flash_reasoning":    reasoning,
+        "cost_usd":           0.0,
     }
 
 
@@ -571,7 +801,7 @@ def validate_wall_span(walls_mm: list[dict], expected_mm: float) -> tuple[bool, 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_dir: Path) -> dict:
+def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_dir: Path) -> tuple[dict, float]:
     logger.init(output_dir, "04_geometry")
 
     doc      = fitz.open(str(pdf_path))
@@ -594,8 +824,8 @@ def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_d
     # Wall extraction
     raw_walls, filter_steps = extract_walls(drawings, plan_bounds)
 
-    # Colinear merging (only meaningful for l×1 line segments)
-    if filter_steps.get("wall_source", "").startswith("filter_d"):
+    # Colinear merging (only for l×1 segment-based wall sources)
+    if filter_steps.get("wall_source", "").startswith(("filter_d", "filter_d_plus_e")):
         logger.section("Colinear segment merging")
         merged = merge_colinear(raw_walls)
         walls_mm = [wall_to_mm(w, page_h, mm) for w in merged]
@@ -603,20 +833,37 @@ def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_d
         walls_mm = [to_real_coords(w["rect"], page_h, mm) for w in raw_walls]
 
     # Span validation — auto-invalidate if contaminated
+    page_max_mm = page_w * mm * 0.95  # walls shouldn't exceed 95% of page width
     expected_span_mm = calibration.get("expected_mm") or GT_OVERALL_MM
-    if expected_span_mm and walls_mm:
-        span_valid, actual_span = validate_wall_span(walls_mm, expected_span_mm)
-        if not span_valid:
-            logger.warn(
-                f"Span check FAILED: actual={actual_span:.0f}mm  expected≈{expected_span_mm}mm  "
-                f"→ invalidating wall set (forcing to 0)"
-            )
-            walls_mm = []
+    if walls_mm:
+        xs_wall = [w["x1_mm"] for w in walls_mm] + [w["x2_mm"] for w in walls_mm]
+        actual_span = max(xs_wall) - min(xs_wall)
+
+        # Primary: check against calibration/GT reference
+        if expected_span_mm:
+            valid = (expected_span_mm * 0.3) <= actual_span <= max(expected_span_mm * 1.3, page_max_mm)
+            if not valid:
+                logger.warn(
+                    f"Span check FAILED: actual={actual_span:.0f}mm  "
+                    f"expected≈{expected_span_mm}mm  page_max={page_max_mm:.0f}mm  "
+                    f"→ invalidating wall set (forcing to 0)"
+                )
+                walls_mm = []
+            else:
+                logger.log(f"Span check: actual={actual_span:.0f}mm  "
+                           f"expected≈{expected_span_mm}mm  delta={abs(actual_span - expected_span_mm):.0f}mm  "
+                           f"page_max={page_max_mm:.0f}mm  valid=True")
         else:
-            logger.log(f"Span check: actual={actual_span:.0f}mm  expected≈{expected_span_mm}mm  "
-                       f"delta={abs(actual_span - expected_span_mm):.0f}mm  valid={span_valid}")
-    elif walls_mm:
-        logger.warn("No calibration reference — skipping span check")
+            # No reference — use page-width as sanity bound
+            if actual_span > page_max_mm:
+                logger.warn(
+                    f"Span exceeds page boundary: {actual_span:.0f}mm > {page_max_mm:.0f}mm  "
+                    f"→ invalidating wall set"
+                )
+                walls_mm = []
+            else:
+                logger.log(f"Span check (page-bound): actual={actual_span:.0f}mm  "
+                           f"page_max={page_max_mm:.0f}mm  valid=True")
 
     # Room centroids → mm
     room_centroids_mm = []
@@ -644,6 +891,8 @@ def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_d
     use_walls = len(walls_mm) >= 20
     logger.log(f"use_wall_geometry: {use_walls}  ({len(walls_mm)} walls)")
 
+    geom_cost = calibration.get("cost_usd", 0.0)
+
     result = {
         "page_dims_pt":      {"width": page_w, "height": page_h},
         "calibration":       calibration,
@@ -652,12 +901,13 @@ def main(pdf_path: Path, classifications: list[dict], rooms_data: dict, output_d
         "wall_count":        len(walls_mm),
         "walls":             walls_mm,
         "room_centroids_mm": room_centroids_mm,
+        "cost_usd":          round(geom_cost, 5),
     }
 
     out = output_dir / "geometry.json"
     out.write_text(json.dumps(result, indent=2))
     logger.log(f"Written: {out}")
-    return result
+    return result, geom_cost
 
 
 if __name__ == "__main__":
@@ -667,11 +917,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Stage 4: Wall geometry extraction")
     parser.add_argument("--classifications", type=Path,
-                        default=OUTPUT_DIR / "classification_report_flash.json")
+                        default=OUTPUT_DIR / "classification_report_flash.json",
+                        help="Classification JSON (unused in this stage)")
     parser.add_argument("--rooms", type=Path,
-                        default=OUTPUT_DIR / "rooms.json")
+                        default=OUTPUT_DIR / "rooms_flash.json",
+                        help="Rooms JSON with centroids and dimension strings")
     args = parser.parse_args()
 
-    cl = json.loads(args.classifications.read_text())
+    raw = json.loads(args.classifications.read_text())
+    cl = raw["pages"] if isinstance(raw, dict) and "pages" in raw else raw
     rm = json.loads(args.rooms.read_text())
     main(PDF_PATH, cl, rm, OUTPUT_DIR)

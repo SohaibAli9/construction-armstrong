@@ -7,7 +7,8 @@ NOT adjacent. Match them by their document order (first label → first value, e
 
 EXTRACT these fields (all in m², coverage also as %):
   site_area           — total site/lot area
-  ground_floor        — proposed dwelling floor area (labelled "PROPOSED DWELLING" or "DWELLING")
+  ground_floor        — proposed ground-floor dwelling area (labelled "PROPOSED DWELLING" or "GROUND FLOOR")
+  first_floor         — upper / first floor area (if multi-storey, otherwise null; labelled "FIRST FLOOR")
   porch               — covered porch area
   outdoor_living      — outdoor living / alfresco area
   site_coverage_pct   — site coverage as a percentage
@@ -30,6 +31,7 @@ OUTPUT FORMAT:
   "areas": {
     "site_area":         { "value": <float or null>, "reasoning": "<brief>" },
     "ground_floor":      { "value": <float or null>, "reasoning": "<brief>" },
+    "first_floor":       { "value": <float or null>, "reasoning": "<brief>" },
     "porch":             { "value": <float or null>, "reasoning": "<brief>" },
     "outdoor_living":    { "value": <float or null>, "reasoning": "<brief>" },
     "site_coverage_pct": { "value": <float or null>, "reasoning": "<brief>" },

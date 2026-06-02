@@ -263,13 +263,13 @@ def flash_narrative(checks: dict, flags: list, geometry_data: dict, areas: dict)
         except (json.JSONDecodeError, RateLimitError, Exception) as e:
             logger.error(f"Flash narrative attempt {attempt+1}: {e}")
             if attempt == 2:
-                return {"error": str(e), "confidence_score": None, "recommendation": "review"}
+                return {"error": str(e), "confidence_score": None, "recommendation": "review", "cost_usd": 0.0}
             time.sleep(5)
 
-    return {"error": "max retries", "confidence_score": None, "recommendation": "review"}
+    return {"error": "max retries", "confidence_score": None, "recommendation": "review", "cost_usd": 0.0}
 
 
-def main(areas_data: dict, rooms_data: dict, geometry_data: dict, output_dir: Path) -> dict:
+def main(areas_data: dict, rooms_data: dict, geometry_data: dict, output_dir: Path) -> tuple[dict, float]:
     logger.init(output_dir, "05_validate")
     flags  = []
     checks = {}
@@ -280,6 +280,9 @@ def main(areas_data: dict, rooms_data: dict, geometry_data: dict, output_dir: Pa
     checks["ground_floor"]   = check_area("ground_floor",   areas.get("ground_floor"),  GT_DWELLING,  flags)
     checks["porch"]          = check_area("porch",          areas.get("porch"),         GT_PORCH,     flags)
     checks["outdoor_living"] = check_area("outdoor_living", areas.get("outdoor_living"),GT_OUTDOOR,   flags)
+
+    doc_status = areas_data.get("project", {}).get("document_status")
+    logger.log(f"Document status: {doc_status}", indent=1)
 
     logger.section("Coverage checks")
     checks["coverage"] = check_coverage(areas, flags)
@@ -358,16 +361,19 @@ def main(areas_data: dict, rooms_data: dict, geometry_data: dict, output_dir: Pa
     narrative = flash_narrative(checks, flags, geometry_data, areas)
     logger.log(f"Client summary: {narrative.get('client_summary', '')}")
 
+    val_cost = narrative.get("cost_usd", 0.0)
+
     result = {
         "overall":   overall,
         "checks":    checks,
         "flags":     flags,
         "narrative": narrative,
+        "cost_usd":  round(val_cost, 5),
     }
     out = output_dir / "validation.json"
     out.write_text(json.dumps(result, indent=2))
     logger.log(f"Written: {out}")
-    return result
+    return result, val_cost
 
 
 if __name__ == "__main__":

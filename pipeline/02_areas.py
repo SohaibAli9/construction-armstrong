@@ -1,195 +1,214 @@
-"""Stage 2: Extract area schedule from A100 and project metadata from title sheet."""
+"""
+Stage 2: LLM-assisted area extraction via DeepSeek Flash.
+
+Sends the raw A100 page text to Flash, which reasons through the multi-column
+layout to correctly pair labels with values. Flash output is authoritative —
+the old Python line-by-line fallback has been removed.
+
+Output: output/areas_flash.json
+"""
 
 import json
 import re
+import time
 import fitz
+from openai import OpenAI, RateLimitError
 from pathlib import Path
+
 import logger
-
-COVERAGE_PCT_RE = re.compile(r'(\d+\.?\d*)\s*%')
-ADDRESS_RE      = re.compile(
-    r'\d+\s+\w[\w\s]+(?:Avenue|Ave|Street|St|Road|Rd|Drive|Dr|Court|Ct|Place|Pl|Way|Lane|Ln)',
-    re.IGNORECASE,
+from config import (
+    PDF_PATH, OUTPUT_DIR,
+    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH,
+    DEEPSEEK_FLASH_INPUT_COST, DEEPSEEK_FLASH_OUTPUT_COST,
 )
-CLIENT_RE  = re.compile(r'(?:client|owner|prepared\s*for)[:\s]+([A-Z][A-Za-z\s&]+?)(?:\n|$)', re.IGNORECASE)
-STATUS_RE  = re.compile(r'(issue\s*for\s*construction|planning\s*application|for\s*construction|ifa)', re.IGNORECASE)
 
-# Ordered label synonyms — first match wins per slot
-AREA_LABELS = [
-    ("site_area",      re.compile(r'\bSITE\s+AREA\b',          re.IGNORECASE)),
-    ("ground_floor",   re.compile(r'\bPROPOSED\s+DWELLING\b',  re.IGNORECASE)),
-    ("porch",          re.compile(r'\bPORCH\b',                 re.IGNORECASE)),
-    ("outdoor_living", re.compile(r'\bOUTDOOR\s+LIVING\b',      re.IGNORECASE)),
-    ("site_coverage",  re.compile(r'\bSITE\s+COVERAGE\b',       re.IGNORECASE)),
-]
-VALUE_RE = re.compile(r'^\s*(\d[\d,]*\.?\d*)\s*(?:m²|m2)?\s*$')
-COVERAGE_LINE_RE = re.compile(r'(\d+\.?\d*)\s*%.*?(\d[\d,]*\.?\d*)\s*(?:m²|m2)', re.IGNORECASE)
+MAX_RETRIES = 3
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
+# Normalise document-status variants from title blocks to a consistent vocabulary.
+_STATUS_MAP = {
+    "issue_for_construction": "issue_for_construction",
+    "for_construction":       "issue_for_construction",
+    "working_drawings":       "working_drawings",
+    "planning_application":   "planning_application",
+    "for_approval":           "for_approval",
+    "ifa":                    "issue_for_construction",
+    "ifc":                    "issue_for_construction",
+    "da":                     "planning_application",
+    "cc":                     "issue_for_construction",
+}
 
-def parse_areas(text: str) -> dict:
-    """
-    Two-pass line-by-line parser.
-
-    get_text() flattens multi-column tables by reading left column first then
-    right column, so the area table arrives as all label lines followed by all
-    value lines.  We collect labels and values separately, then zip by position.
-    """
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-
-    # Find the AREA ANALYSIS block
-    start = next((i for i, l in enumerate(lines) if 'AREA ANALYSIS' in l.upper()), None)
-    if start is None:
-        logger.warn("'AREA ANALYSIS' heading not found in text")
-        logger.log(f"First 20 lines: {lines[:20]}", indent=1)
-        return {}
-
-    block = lines[start:]
-    logger.section(f"Area block (lines {start}–{start+len(block)}, first 30 shown)")
-    for i, l in enumerate(block[:30]):
-        logger.log(f"  [{start+i:02d}] {repr(l)}", indent=1)
-
-    # Pass 1: collect label slots in document order
-    label_slots: list[str] = []   # e.g. ["site_area", "ground_floor", ...]
-    seen: set[str] = set()
-    for line in block:
-        for key, pattern in AREA_LABELS:
-            if key not in seen and pattern.search(line):
-                label_slots.append(key)
-                seen.add(key)
-                logger.log(f"  label slot found: {key}  ← '{line}'", indent=1)
-                break
-
-    # Pass 2: collect plain numeric value lines in document order
-    value_lines: list[str] = []
-    for line in block:
-        if VALUE_RE.match(line):
-            value_lines.append(line)
-
-    logger.log(f"Label slots ({len(label_slots)}): {label_slots}")
-    logger.log(f"Value lines ({len(value_lines)}): {value_lines}")
-
-    # Zip labels → values
-    areas: dict[str, float | None] = {}
-    for key, vline in zip(label_slots, value_lines):
-        val = float(VALUE_RE.match(vline).group(1).replace(',', ''))
-        areas[key] = val
-        logger.log(f"  {key:<20} = {val}", indent=1)
-
-    # Site coverage needs special handling (contains % and m²)
-    cov_line = next((l for l in block if '%' in l and 'm' in l.lower()), None)
-    if cov_line:
-        m = COVERAGE_LINE_RE.search(cov_line)
-        if m:
-            areas['site_coverage_pct'] = float(m.group(1))
-            areas['site_coverage_m2']  = float(m.group(2).replace(',', ''))
-            logger.log(f"  site_coverage_pct = {areas['site_coverage_pct']}", indent=1)
-            logger.log(f"  site_coverage_m2  = {areas['site_coverage_m2']}", indent=1)
-        else:
-            logger.warn(f"Coverage line found but regex failed: {repr(cov_line)}")
-    elif 'site_coverage' in areas:
-        # Value was already picked up by zip; try to split pct vs m²
-        logger.warn("site_coverage: no dedicated pct/m² line found, using zipped value as pct")
-        areas['site_coverage_pct'] = areas.pop('site_coverage', None)
-
-    if not areas:
-        logger.warn("No areas extracted — dumping raw block for inspection")
-        logger.log('\n'.join(block[:40]), indent=1)
-
-    return areas
+_system_prompt: str | None = None
 
 
-def parse_project_meta(text: str) -> dict:
-    addr_m   = ADDRESS_RE.search(text)
-    client_m = CLIENT_RE.search(text)
-    status_m = STATUS_RE.search(text)
-    date_m   = re.search(r'\b(\d{1,2}/\d{2}/\d{2,4})\b', text)
-    state_m  = re.search(r'\b(VIC|NSW|QLD|SA|WA|TAS|ACT|NT)\b', text)
-
-    logger.section("Project metadata")
-    logger.log(f"address match:  {addr_m.group(0)   if addr_m   else 'NOT FOUND'}", indent=1)
-    logger.log(f"client match:   {client_m.group(1) if client_m else 'NOT FOUND'}", indent=1)
-    logger.log(f"status match:   {status_m.group(1) if status_m else 'NOT FOUND'}", indent=1)
-    logger.log(f"date match:     {date_m.group(1)   if date_m   else 'NOT FOUND'}", indent=1)
-    logger.log(f"state match:    {state_m.group(1)  if state_m  else 'NOT FOUND'}", indent=1)
-
-    raw_status = (status_m.group(1) or "").lower() if status_m else None
-    status = "planning_application" if raw_status and "planning" in raw_status else "issue_for_construction"
-
-    return {
-        "address":         addr_m.group(0).strip() if addr_m else None,
-        "client":          client_m.group(1).strip() if client_m else None,
-        "state":           state_m.group(1) if state_m else None,
-        "document_type":   "working_drawings",
-        "document_status": status,
-        "date":            date_m.group(1) if date_m else None,
-    }
+def load_prompt() -> str:
+    global _system_prompt
+    if _system_prompt is None:
+        path = PROMPTS_DIR / "extract_areas.txt"
+        _system_prompt = path.read_text(encoding="utf-8")
+        logger.log(f"Loaded prompt: {path}  ({len(_system_prompt)} chars)")
+    return _system_prompt
 
 
-def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> dict:
+def call_flash(page_text: str) -> tuple[dict, float]:
+    """Returns (parsed_json, cost_usd). Raises on total failure."""
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+
+    user_msg = f"Site plan page text (raw PyMuPDF output):\n\n{page_text}"
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.log(f"DeepSeek Flash call attempt {attempt+1}/{MAX_RETRIES}")
+            resp = client.chat.completions.create(
+                model=DEEPSEEK_FLASH,
+                messages=[
+                    {"role": "system", "content": load_prompt()},
+                    {"role": "user",   "content": user_msg},
+                ],
+                max_tokens=2048,
+                temperature=0,
+            )
+            raw     = resp.choices[0].message.content.strip()
+            in_tok  = resp.usage.prompt_tokens
+            out_tok = resp.usage.completion_tokens
+            cost    = in_tok * DEEPSEEK_FLASH_INPUT_COST + out_tok * DEEPSEEK_FLASH_OUTPUT_COST
+
+            logger.log(f"Tokens: {in_tok} in / {out_tok} out  cost=${cost:.4f}")
+
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+
+            parsed = json.loads(raw)
+            logger.log(f"Flash response parsed OK")
+            return parsed, cost
+
+        except RateLimitError:
+            wait = 60 * (attempt + 1)
+            logger.warn(f"Rate limit — sleeping {wait}s")
+            time.sleep(wait)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse failed: {e}")
+            logger.log(f"Raw output:\n{raw[:600]}", indent=1)
+            if attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"API error: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(5 * (attempt + 1))
+
+    raise RuntimeError("DeepSeek Flash call failed after all retries")
+
+
+def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> tuple[dict, float]:
     logger.init(output_dir, "02_areas")
 
     doc = fitz.open(str(pdf_path))
-
-    site_idx  = next((p["page_index"] for p in classifications if p["classification"] == "site_plan"),    2)
-    title_idx = next((p["page_index"] for p in classifications if p["classification"] == "title_sheet"),  0)
-    logger.log(f"Site plan page index:  {site_idx}  (1-based: p{site_idx+1})")
-    logger.log(f"Title sheet page index:{title_idx}  (1-based: p{title_idx+1})")
+    site_idx = next(
+        (p["page_index"] for p in classifications if p["classification"] == "site_plan"), 2
+    )
+    title_idx = next(
+        (p["page_index"] for p in classifications if p["classification"] == "title_sheet"), 0
+    )
+    logger.log(f"Site plan page:  {site_idx}  (1-based: p{site_idx+1})")
+    logger.log(f"Title page:      {title_idx}  (1-based: p{title_idx+1})")
 
     site_text  = doc[site_idx].get_text()
     title_text = doc[title_idx].get_text()
-    logger.log(f"Site plan text length:  {len(site_text)} chars")
-    logger.log(f"Title sheet text length:{len(title_text)} chars")
-
-    # Log the raw area block for inspection
-    area_block_start = site_text.upper().find("AREA")
-    if area_block_start >= 0:
-        logger.section("Raw area block (200 chars around first AREA mention)")
-        logger.log(repr(site_text[max(0, area_block_start-20):area_block_start+200]), indent=1)
-
-    areas = parse_areas(site_text)
-    meta  = parse_project_meta(title_text + "\n" + doc[0].get_text())
-
-    def annotate(val, source="A100_area_schedule"):
-        return {"value": val, "unit": "m2", "confidence": 0.98, "source": source} if val is not None else None
-
-    annotated = {
-        "site_area":         annotate(areas.get("site_area")),
-        "ground_floor":      annotate(areas.get("ground_floor")),
-        "porch":             annotate(areas.get("porch")),
-        "outdoor_living":    annotate(areas.get("outdoor_living")),
-        "site_coverage_pct": {"value": areas.get("site_coverage_pct"),
-                               "confidence": 0.98, "source": "A100_area_schedule"}
-                              if areas.get("site_coverage_pct") else None,
-        "site_coverage_m2":  annotate(areas.get("site_coverage_m2")),
-    }
-
-    logger.section("Extracted areas summary")
-    for k, v in annotated.items():
-        val_str = str(v["value"]) if v else "MISSING"
-        logger.log(f"{k:<25} {val_str}", indent=1)
-
     doc.close()
 
-    result = {"project": meta, "areas": annotated, "_raw_areas": areas}
-    out = output_dir / "areas.json"
+    logger.log(f"Site plan text: {len(site_text)} chars")
+    logger.section("Raw site plan text (first 800 chars)")
+    logger.log(repr(site_text[:800]), indent=1)
+
+    # Run Flash
+    logger.section("Sending to DeepSeek Flash")
+    flash_result, cost = call_flash(site_text + "\n\nTitle page text:\n" + title_text)
+
+    flash_areas   = flash_result.get("areas", {})
+    flash_project = flash_result.get("project", {})
+    overall_reasoning = flash_result.get("overall_reasoning", "")
+
+    logger.section("Flash reasoning")
+    logger.log(overall_reasoning, indent=1)
+
+    logger.section("Flash per-field results")
+    for f, info in flash_areas.items():
+        logger.log(f"  {f:<22}  value={info.get('value')}  reasoning: {info.get('reasoning','')}", indent=1)
+
+    # Build annotated output — Flash only
+    def ann(field):
+        info = flash_areas.get(field) or {}
+        val  = info.get("value")
+        if val is None:
+            return None
+        return {
+            "value":      val,
+            "unit":       "m2",
+            "confidence": 0.98,
+            "source":     "A100_area_schedule:flash",
+            "reasoning":  info.get("reasoning", ""),
+        }
+
+    annotated = {
+        "site_area":         ann("site_area"),
+        "ground_floor":      ann("ground_floor"),
+        "first_floor":       ann("first_floor"),
+        "porch":             ann("porch"),
+        "outdoor_living":    ann("outdoor_living"),
+        "site_coverage_pct": ann("site_coverage_pct"),
+        "site_coverage_m2":  ann("site_coverage_m2"),
+    }
+
+    # Project metadata — Flash only, status normalised
+    raw_status = (flash_project.get("status") or "").lower().strip()
+    project = {
+        "address":         flash_project.get("address"),
+        "client":          flash_project.get("client"),
+        "state":           flash_project.get("state"),
+        "document_type":   "working_drawings",
+        "document_status": _STATUS_MAP.get(raw_status, raw_status),
+        "date":            flash_project.get("date"),
+    }
+
+    logger.section("Final project metadata")
+    for k, v in project.items():
+        logger.log(f"  {k:<20} {v}", indent=1)
+
+    logger.log(f"Total cost: ${cost:.4f}")
+
+    result = {
+        "project":            project,
+        "areas":              annotated,
+        "cost_usd":           round(cost, 5),
+        "_raw_flash":         flash_areas,
+        "_overall_reasoning": overall_reasoning,
+    }
+
+    out = output_dir / "areas_flash.json"
     out.write_text(json.dumps(result, indent=2))
     logger.log(f"Written: {out}")
-    return result
+    return result, cost
 
 
 if __name__ == "__main__":
     import argparse
-    from config import PDF_PATH, OUTPUT_DIR
 
-    parser = argparse.ArgumentParser(description="Stage 2: extract areas from PDF")
-    parser.add_argument(
-        "--classifications",
-        type=Path,
-        default=OUTPUT_DIR / "classification_report_flash.json",
-        help="Path to classification JSON (default: output/classification_report_flash.json)",
-    )
+    parser = argparse.ArgumentParser(description="Stage 2b: Flash area extraction")
+    parser.add_argument("--pdf", type=Path, default=PDF_PATH,
+                        help="Path to PDF (default: config.PDF_PATH)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory (default: config.OUTPUT_DIR)")
+    parser.add_argument("--classifications", type=Path, default=None,
+                        help="Path to classification JSON (default: <output-dir>/classification_report_flash.json)")
     args = parser.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    cl = json.loads(args.classifications.read_text())
-    main(PDF_PATH, cl, OUTPUT_DIR)
+    out_dir = args.output_dir or OUTPUT_DIR
+    cl_path = args.classifications or (out_dir / "classification_report_flash.json")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = json.loads(cl_path.read_text())
+    cl = raw["pages"] if isinstance(raw, dict) and "pages" in raw else raw
+    main(args.pdf, cl, out_dir)

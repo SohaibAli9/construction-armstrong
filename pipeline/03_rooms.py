@@ -1,45 +1,45 @@
-"""Stage 3: Extract room labels and dimension strings from A201 (proposed plan)."""
+"""
+Stage 3: LLM-assisted room extraction via DeepSeek Flash.
+
+Sends all text spans with positions and font sizes to Flash so it can reason
+about which spans are canonical room labels vs legend/annotation duplicates.
+
+Output: output/rooms_flash.json
+"""
 
 import json
 import re
+import time
 import fitz
+from openai import OpenAI, RateLimitError
 from pathlib import Path
+
 import logger
+from config import (
+    PDF_PATH, OUTPUT_DIR,
+    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH,
+    DEEPSEEK_FLASH_INPUT_COST, DEEPSEEK_FLASH_OUTPUT_COST,
+    GT_OVERALL_MM,
+)
 
-# ORDER MATTERS: more specific patterns must come before patterns whose
-# regex is a substring of the specific one (e.g. outdoor_living before living,
-# ensuite before entry, powder_room before porch).
-ROOM_LABELS = {
-    "outdoor_living": re.compile(r'\bOutdoor\s*Living\b', re.IGNORECASE),
-    "living":         re.compile(r'\bLiving\b',           re.IGNORECASE),
-    "bedroom":        re.compile(r'\bBed\s*0?(\d)\b',     re.IGNORECASE),
-    "wir":            re.compile(r'\bWIR\b',              re.IGNORECASE),
-    "ensuite":        re.compile(r'\bENS\b',              re.IGNORECASE),
-    "powder_room":    re.compile(r'\bPdr\b',              re.IGNORECASE),
-    "bathroom":       re.compile(r'\bBath\b',             re.IGNORECASE),
-    "laundry":        re.compile(r'\bLdy\b',              re.IGNORECASE),
-    "kitchen":        re.compile(r'\bKitchen\b',          re.IGNORECASE),
-    "dining":         re.compile(r'\bDining\b',           re.IGNORECASE),
-    "sitting":        re.compile(r'\bSitting\b',          re.IGNORECASE),
-    "entry":          re.compile(r'\bEntry\b',            re.IGNORECASE),
-    "porch":          re.compile(r'\bPorch\b',            re.IGNORECASE),
-    "study":          re.compile(r'\bStudy\b',            re.IGNORECASE),
-    "pantry":         re.compile(r'\bPty\b',              re.IGNORECASE),
-    "shed":           re.compile(r'\bShed\b',             re.IGNORECASE),
-    "garage":         re.compile(r'\bGarage\b',           re.IGNORECASE),
-}
+MAX_RETRIES = 3
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-DIM_STRING_RE = re.compile(r'^\d{3,5}$')   # standalone 3-5 digit = dimension in mm
+_system_prompt: str | None = None
 
-# Room labels in the drawing body are rendered at ~9.9 pt.
-# Legend rows, revision notes, and title-block annotations are ≤7.5 pt.
-ROOM_LABEL_MIN_SIZE = 8.5
+
+def load_prompt() -> str:
+    global _system_prompt
+    if _system_prompt is None:
+        path = PROMPTS_DIR / "extract_rooms.txt"
+        _system_prompt = path.read_text(encoding="utf-8")
+        logger.log(f"Loaded prompt: {path}  ({len(_system_prompt)} chars)")
+    return _system_prompt
 
 
 def extract_spans(page: fitz.Page) -> list[dict]:
     spans = []
-    blocks = page.get_text("dict")["blocks"]
-    for block in blocks:
+    for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
@@ -49,99 +49,110 @@ def extract_spans(page: fitz.Page) -> list[dict]:
                     continue
                 bbox = span["bbox"]
                 spans.append({
-                    "text": text,
-                    "bbox": bbox,
-                    "cx":   (bbox[0] + bbox[2]) / 2,
-                    "cy":   (bbox[1] + bbox[3]) / 2,
-                    "size": span.get("size", 0),
+                    "label": text,
+                    "x_pt":  round((bbox[0] + bbox[2]) / 2, 1),
+                    "y_pt":  round((bbox[1] + bbox[3]) / 2, 1),
+                    "size":  round(span.get("size", 0), 2),
                 })
     return spans
 
 
-def classify_spans(spans: list[dict]) -> dict:
-    room_centroids  = []
-    dim_strings     = []
-    found_rooms:  dict[str, list] = {}
-    unmatched_sample: list[str]   = []
-    skipped_small: list[str]      = []
+def build_user_message(spans: list[dict], page_w: float, page_h: float) -> str:
+    lines = [
+        f"Page dimensions: {page_w:.0f} x {page_h:.0f} pts",
+        f"Total spans: {len(spans)}",
+        "",
+        "Spans (label | x_pt | y_pt | size):",
+    ]
+    for s in spans:
+        lines.append(f"  {s['label']!r:<35}  x={s['x_pt']:>7.1f}  y={s['y_pt']:>7.1f}  size={s['size']:>5.2f}")
+    return "\n".join(lines)
 
-    for span in spans:
-        text    = span["text"]
-        matched = False
 
-        for room_type, pattern in ROOM_LABELS.items():
-            if pattern.search(text):
-                if span["size"] < ROOM_LABEL_MIN_SIZE:
-                    # Legend / annotation text — log and skip
-                    skipped_small.append(
-                        f"'{text}'  size={span['size']:.1f}  "
-                        f"at ({span['cx']:.0f},{span['cy']:.0f})  [{room_type}]"
-                    )
-                    matched = True   # prevent falling through to unmatched_sample
-                    break
+def call_flash(user_message: str) -> tuple[dict, float]:
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
-                entry = {
-                    "label": text,
-                    "type":  room_type,
-                    "x_pt":  span["cx"],
-                    "y_pt":  span["cy"],
-                    "size":  span["size"],
-                }
-                room_centroids.append(entry)
-                found_rooms.setdefault(room_type, []).append(text)
-                logger.log(
-                    f"ROOM  {room_type:<18} '{text}'  "
-                    f"at ({span['cx']:.1f}, {span['cy']:.1f})  size={span['size']:.1f}",
-                    indent=1,
-                )
-                matched = True
-                break
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.log(f"DeepSeek Flash call attempt {attempt+1}/{MAX_RETRIES}")
+            resp = client.chat.completions.create(
+                model=DEEPSEEK_FLASH,
+                messages=[
+                    {"role": "system", "content": load_prompt()},
+                    {"role": "user",   "content": user_message},
+                ],
+                max_tokens=12000,
+                temperature=0,
+            )
+            raw     = resp.choices[0].message.content.strip()
+            in_tok  = resp.usage.prompt_tokens
+            out_tok = resp.usage.completion_tokens
+            cost    = in_tok * DEEPSEEK_FLASH_INPUT_COST + out_tok * DEEPSEEK_FLASH_OUTPUT_COST
 
-        if not matched and DIM_STRING_RE.fullmatch(text):
-            val = int(text)
-            if 100 <= val <= 50000:
-                dim_strings.append({
-                    "value": val,
-                    "x_pt":  span["cx"],
-                    "y_pt":  span["cy"],
-                    "bbox":  span["bbox"],
-                })
+            logger.log(f"Tokens: {in_tok} in / {out_tok} out  cost=${cost:.4f}")
 
-        if not matched and len(unmatched_sample) < 30:
-            unmatched_sample.append(f"'{text}' @({span['cx']:.0f},{span['cy']:.0f})")
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
 
-    logger.section(f"Skipped small-text room matches ({len(skipped_small)} — legend/annotations)")
-    for s in skipped_small:
-        logger.log(s, indent=1)
+            parsed = json.loads(raw)
+            return parsed, cost
 
-    return {
-        "room_centroids":    room_centroids,
-        "dimension_strings": dim_strings,
-        "found_rooms":       found_rooms,
-        "unmatched_sample":  unmatched_sample,
-        "skipped_small":     skipped_small,
+        except RateLimitError:
+            wait = 60 * (attempt + 1)
+            logger.warn(f"Rate limit — sleeping {wait}s")
+            time.sleep(wait)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse failed: {e}")
+            logger.log(f"Raw output:\n{raw[:600]}", indent=1)
+            if attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"API error: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(5 * (attempt + 1))
+
+    raise RuntimeError("DeepSeek Flash call failed after all retries")
+
+
+def validate_flash_counts(flash_rooms: dict, flash_centroids: list[dict]) -> dict:
+    """Check centroids match room counts; fix mismatches. Returns corrected rooms dict."""
+    type_to_key = {
+        "bedroom": "bedrooms", "bedrooms": "bedrooms",
+        "ensuite": "ensuite", "bathroom": "bathroom",
+        "powder_room": "powder_room", "kitchen": "kitchen",
+        "laundry": "laundry", "wir": "wir", "pantry": "pantry",
+        "study": "study", "living": "living", "dining": "dining",
+        "sitting": "sitting", "entry": "entry", "porch": "porch",
+        "outdoor_living": "outdoor_living", "hall": "hall",
     }
+    centroid_counts: dict[str, int] = {}
+    for c in flash_centroids:
+        ct = c.get("type", "")
+        key = type_to_key.get(ct, ct)
+        centroid_counts[key] = centroid_counts.get(key, 0) + 1
+
+    fixed = {}
+    for key, info in flash_rooms.items():
+        expected = centroid_counts.get(key, 0)
+        current = info.get("count", 0)
+        if expected != current:
+            logger.warn(f"Flash count mismatch: {key} has {current} in rooms but {expected} centroids — fixing")
+            info["count"] = expected
+        fixed[key] = info
+
+    # Add any centroids without a rooms entry
+    for key, count in centroid_counts.items():
+        if key not in fixed:
+            logger.warn(f"Flash missing rooms key '{key}' — adding from centroids ({count})")
+            fixed[key] = {"count": count}
+
+    return fixed
 
 
-def build_room_summary(found_rooms: dict) -> dict:
-    beds = found_rooms.get("bedroom", [])
-    return {
-        "bedrooms":      {"count": len(beds), "labels": beds},
-        "ensuite":       {"count": len(found_rooms.get("ensuite", []))},
-        "bathroom":      {"count": len(found_rooms.get("bathroom", []))},
-        "powder_room":   {"count": len(found_rooms.get("powder_room", []))},
-        "kitchen":       {"count": len(found_rooms.get("kitchen", []))},
-        "laundry":       {"count": len(found_rooms.get("laundry", []))},
-        "wir":           {"count": len(found_rooms.get("wir", []))},
-        "pantry":        {"count": len(found_rooms.get("pantry", []))},
-        "study":         {"count": len(found_rooms.get("study", []))},
-        "living":        {"count": len(found_rooms.get("living", []))},
-        "dining":        {"count": len(found_rooms.get("dining", []))},
-        "sitting":       {"count": len(found_rooms.get("sitting", []))},
-    }
-
-
-def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> dict:
+def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> tuple[dict, float]:
     logger.init(output_dir, "03_rooms")
 
     doc = fitz.open(str(pdf_path))
@@ -149,59 +160,94 @@ def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> dict:
         (p["page_index"] for p in classifications if p["classification"] == "proposed_plan_primary"),
         5,
     )
-    page        = doc[plan_idx]
-    page_height = page.rect.height
-    page_width  = page.rect.width
+    page     = doc[plan_idx]
+    page_h   = page.rect.height
+    page_w   = page.rect.width
+    logger.log(f"Page index {plan_idx}  (1-based: p{plan_idx+1})")
+    logger.log(f"Page dims: {page_w:.1f} x {page_h:.1f} pts")
 
-    logger.log(f"Using page index {plan_idx}  (1-based: p{plan_idx+1})")
-    logger.log(f"Page size: {page_width:.1f} x {page_height:.1f} pts")
-
-    spans  = extract_spans(page)
-    logger.log(f"Total spans extracted: {len(spans)}")
-
-    logger.section("Room label scan")
-    result = classify_spans(spans)
-
-    logger.section("Dimension strings (showing values near 20490)")
-    dims_sorted = sorted(result["dimension_strings"], key=lambda d: abs(d["value"] - 20490))
-    for d in dims_sorted[:10]:
-        logger.log(f"  {d['value']:>6}  at ({d['x_pt']:.1f}, {d['y_pt']:.1f})", indent=1)
-    logger.log(f"Total dimension strings: {len(result['dimension_strings'])}")
-
-    logger.section("Unmatched span sample (first 30)")
-    for s in result["unmatched_sample"]:
-        logger.log(s, indent=1)
-
-    # Overall dimension check
-    exact = [d for d in result["dimension_strings"] if d["value"] == 20490]
-    if exact:
-        logger.log(f"20490 dimension FOUND at ({exact[0]['x_pt']:.1f}, {exact[0]['y_pt']:.1f})")
-    else:
-        closest = dims_sorted[0] if dims_sorted else None
-        logger.warn(f"20490 dimension NOT FOUND. Closest: {closest['value'] if closest else 'none'}")
-
-    room_summary = build_room_summary(result["found_rooms"])
-
-    logger.section("Room summary")
-    for rtype, info in room_summary.items():
-        logger.log(f"{rtype:<18} count={info['count']}", indent=1)
-
+    spans = extract_spans(page)
     doc.close()
+    logger.log(f"Spans extracted: {len(spans)}")
 
-    out_data = {
-        "plan_page_index":   plan_idx,
-        "page_height_pt":    page_height,
-        "page_width_pt":     page_width,
-        "total_spans":       len(spans),
-        "rooms":             room_summary,
-        "room_centroids":    result["room_centroids"],
-        "dimension_strings": result["dimension_strings"],
+    logger.section("Size distribution of all spans")
+    from collections import Counter
+    size_buckets = Counter(round(s["size"]) for s in spans)
+    for sz, cnt in sorted(size_buckets.items()):
+        logger.log(f"  size ~{sz:>3}pt  → {cnt} spans", indent=1)
+
+    logger.section("Sending to DeepSeek Flash")
+    user_msg = build_user_message(spans, page_w, page_h)
+    logger.log(f"User message: {len(user_msg)} chars  ({len(spans)} spans)")
+
+    flash_result, cost = call_flash(user_msg)
+
+    flash_rooms     = flash_result.get("rooms", {})
+    flash_centroids = flash_result.get("canonical_centroids", [])
+    ignored         = flash_result.get("ignored_spans", [])
+    reasoning       = flash_result.get("overall_reasoning", "")
+
+    logger.section("Flash overall reasoning")
+    logger.log(reasoning, indent=1)
+
+    logger.section("Flash room counts")
+    for rtype, info in flash_rooms.items():
+        logger.log(f"  {rtype:<18}  count={info.get('count')}  labels={info.get('labels', '')}", indent=1)
+
+    logger.section(f"Canonical centroids ({len(flash_centroids)})")
+    for c in flash_centroids:
+        logger.log(
+            f"  {c.get('label')!r:<25}  type={c.get('type'):<15}  "
+            f"({c.get('x_pt'):.1f}, {c.get('y_pt'):.1f})  "
+            f"size={c.get('size'):.1f}  — {c.get('reasoning','')}",
+            indent=1,
+        )
+
+    # Validate centroids vs room counts
+    logger.section("Validating Flash consistency")
+    flash_rooms = validate_flash_counts(flash_rooms, flash_centroids)
+
+    logger.section(f"Ignored spans ({len(ignored)})")
+    for s in ignored:
+        logger.log(f"  {s}", indent=1)
+
+    # Also pull dimension strings from raw spans
+    DIM_RE = re.compile(r'^[\d,]{3,7}$')
+    dim_strings = [
+        {"value": int(s["label"].replace(",", "")), "x_pt": s["x_pt"], "y_pt": s["y_pt"]}
+        for s in spans
+        if DIM_RE.fullmatch(s["label"]) and 100 <= int(s["label"].replace(",", "")) <= 50000
+    ]
+    logger.log(f"Dimension strings extracted: {len(dim_strings)}")
+    if GT_OVERALL_MM:
+        exact_target = [d for d in dim_strings if d["value"] == GT_OVERALL_MM]
+        if exact_target:
+            logger.log(f"{GT_OVERALL_MM} FOUND at ({exact_target[0]['x_pt']:.1f}, {exact_target[0]['y_pt']:.1f})")
+        else:
+            logger.warn(f"{GT_OVERALL_MM} NOT FOUND in dimension strings")
+    elif dim_strings:
+        largest = max(dim_strings, key=lambda d: d["value"])
+        logger.log(f"No GT_OVERALL_MM set — largest dim string: {largest['value']} at ({largest['x_pt']:.1f}, {largest['y_pt']:.1f})")
+
+    logger.log(f"Total cost: ${cost:.4f}")
+
+    result = {
+        "plan_page_index":    plan_idx,
+        "page_height_pt":     page_h,
+        "page_width_pt":      page_w,
+        "total_spans":        len(spans),
+        "rooms":              flash_rooms,
+        "room_centroids":     flash_centroids,
+        "dimension_strings":  dim_strings,
+        "cost_usd":           round(cost, 5),
+        "_ignored_spans":     ignored,
+        "_overall_reasoning": reasoning,
     }
 
-    out = output_dir / "rooms.json"
-    out.write_text(json.dumps(out_data, indent=2))
+    out = output_dir / "rooms_flash.json"
+    out.write_text(json.dumps(result, indent=2))
     logger.log(f"Written: {out}")
-    return out_data
+    return result, cost
 
 
 if __name__ == "__main__":
@@ -209,14 +255,19 @@ if __name__ == "__main__":
     from config import PDF_PATH, OUTPUT_DIR
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    parser = argparse.ArgumentParser(description="Stage 3: Room label extraction")
-    parser.add_argument(
-        "--classifications",
-        type=Path,
-        default=OUTPUT_DIR / "classification_report_flash.json",
-        help="Path to classification JSON (default: output/classification_report_flash.json)",
-    )
+    parser = argparse.ArgumentParser(description="Stage 3: Room extraction (Flash)")
+    parser.add_argument("--pdf", type=Path, default=PDF_PATH,
+                        help="Path to PDF (default: config.PDF_PATH)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory (default: config.OUTPUT_DIR)")
+    parser.add_argument("--classifications", type=Path, default=None,
+                        help="Path to classification JSON (default: <output-dir>/classification_report_flash.json)")
     args = parser.parse_args()
 
-    cl = json.loads(args.classifications.read_text())
-    main(PDF_PATH, cl, OUTPUT_DIR)
+    out_dir = args.output_dir or OUTPUT_DIR
+    cl_path = args.classifications or (out_dir / "classification_report_flash.json")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = json.loads(cl_path.read_text())
+    cl = raw["pages"] if isinstance(raw, dict) and "pages" in raw else raw
+    main(args.pdf, cl, out_dir)

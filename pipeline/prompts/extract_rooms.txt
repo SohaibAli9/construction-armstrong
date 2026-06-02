@@ -1,48 +1,98 @@
-You are extracting room inventory from an Australian residential architectural floor plan (A201 — Proposed Plan).
+You are extracting room inventory from an Australian residential architectural
+floor plan (typically A201 — Proposed Ground Floor Plan).
 
-The input is a list of text spans extracted by PyMuPDF from the vector PDF. Each span has:
+INPUT:
+A list of text spans extracted from the vector PDF. Each span has:
   - label: the text string
   - x_pt, y_pt: centroid position in PDF points (origin top-left)
   - size: rendered font size in points
 
-KEY INSIGHT — the page has two layers of text at different font sizes:
-  ~9.5–10.5 pt  → real room labels inside the drawing (these are canonical)
-  ~6.5–7.5 pt   → legend rows, revision schedule, title block annotations (these are duplicates to ignore)
+TEXT LAYERS:
+These drawings have multiple text layers at different font sizes:
+  1. TITLE / drawing number     → largest (12pt+) — ignore
+  2. ROOM LABELS                → second-largest cluster — these are canonical (keep)
+  3. Dimension annotations      → smaller than room labels (ignore for rooms)
+  4. Legend / title block       → smallest (ignore)
+  5. Specification notes        → smallest (ignore)
 
-Your job is to identify exactly ONE canonical label per room space and return a clean room inventory.
-
-EXPECTED ROOMS for this specific dwelling (58 Locksley Avenue, Reservoir VIC):
-  Bed 01, Bed 02, Bed 03, WIR, ENS (ensuite), Bath, Pdr (powder room),
-  Ldy (laundry), Living, Kitchen, Dining, Sitting, Entry, Porch,
-  Study, Pty (pantry), Outdoor Living
+HOW TO IDENTIFY CANONICAL ROOM LABELS:
+- Room labels are the SECOND-LARGEST font size cluster on the page
+  (below the drawing title, above dimension numbers).
+- They are positioned INSIDE the floor plan body (roughly the center 60-70%
+  of the page), not along page edges.
+- They are single labels for individual room spaces (not combined with slashes).
+- Each distinct room space has exactly ONE canonical label.
 
 RULES:
-- If the same room type appears at both ~7pt and ~10pt, the ~10pt version is canonical.
-- Combined labels like "KITCHEN / LIVING / DINING", "BED 01 / STORE", "ENS / BATH" appear in
-  the legend/annotation zone (small font, near page edges) — do NOT count them as rooms.
-- "OUTDOOR LIVING" at ~7pt near the right edge is a legend entry — the canonical outdoor living
-  label will be at ~10pt inside the plan body.
-- "PROPOSED SHED," "AMENDED KITCHEN..." etc. are revision notes — ignore.
+- If the same label text appears at both the canonical room-label size and a
+  smaller size, the version at the canonical size INSIDE the plan body is
+  authoritative. The copies at smaller sizes in the legend/annotation zone are
+  duplicates to be ignored — NOT the other way around.
+- Combined labels containing slashes ("KITCHEN / LIVING / DINING", "BED 2/BATH",
+  "ENS / BATH", "STAIRS/MEALS") always appear in annotation/legend zones at
+  small font sizes — do NOT count them as rooms.
+- Labels outside the plan body (in title block, revision notes, legend rows near
+  page edges) should be ignored.
 - Count each distinct room space exactly once.
-- For bedrooms, extract the specific labels (Bed 01, Bed 02, Bed 03).
+- For bedrooms, extract the specific labels (e.g. "Bed 01", "Bed 02", "BED 2").
+- When two adjacent labels at the canonical room-label size sit close together
+  (within ~30pt) and their combined text forms a compound room name
+  (e.g. "Outdoor" + "Living" → "Outdoor Living"), merge them into ONE canonical
+  centroid for the compound type. Do NOT count either individual label as a
+  separate room — the compound is one room, not two.
 
-Return ONLY a JSON object. No markdown, no explanation outside the JSON.
+ROOM TYPE MAPPING — map these labels to their standardized type.
+CRITICAL: When a label is listed below, count it under that type even if it
+sounds like storage (WIL, WIP, WIR) — they are standard Australian abbreviations
+for Walk-in Linen, Walk-in Pantry, and Walk-in Robe respectively.
 
-OUTPUT FORMAT:
+  bedroom:       Bed 01, Bed 02, Bed 03, BED 2, BED 3, Master Bedroom
+  ensuite:       ENS, Ensuite
+  bathroom:      Bath, Bathroom, BATH
+  powder_room:   Pdr, Powder Room, WC, Toilet, PDR
+  laundry:       Laundry, Ldry, Ldy, LAUNDRY, WIL
+  kitchen:       Kitchen, KITCHEN
+  dining:        Dining, Meals, MEALS
+  living:        Living, Family, Lounge, LIVING
+  sitting:       Sitting, Retreat
+  entry:         Entry, Foyer
+  hall:          Hall, Passage, PASSAGE
+  porch:         Porch, PORCH
+  study:         Study, Home Office, Office, HOME OFFICE
+  pantry:        Pantry, Pty, WIP
+  wir:           WIR, Walk-in Robe
+  outdoor_living: Outdoor Living, Alfresco, Deck
+
+IGNORE these common non-room labels:
+  - Floor finishes: CARPET, TILES, TIMBER, CONCRETE, etc.
+  - Tags: D01-D14, W01-W09, TC01, etc.
+  - Level annotations: FFL, NGL, "Porch 79.95"
+  - Construction notes: "NOGGINGS", "STUDS", "PROPOSED SHED", etc.
+  - Door/window/fixture labels: SL, CBD, SHOWER, ROBE, etc.
+  - Title block: drawing number, scale, architect name, project address
+  - Separate outbuildings: sheds, garages (unless part of main dwelling)
+  - Legend annotations like "EXISTING WALLS", "NEW WALLS", "DEMOLISHED"
+
+OUTPUT FORMAT — Return ONLY a JSON object. No markdown, no explanation:
+
 {
   "rooms": {
-    "bedrooms":      { "count": <int>, "labels": ["Bed 01", "Bed 02", "Bed 03"] },
-    "ensuite":       { "count": <int> },
-    "bathroom":      { "count": <int> },
-    "powder_room":   { "count": <int> },
-    "kitchen":       { "count": <int> },
-    "laundry":       { "count": <int> },
-    "wir":           { "count": <int> },
-    "pantry":        { "count": <int> },
-    "study":         { "count": <int> },
-    "living":        { "count": <int> },
-    "dining":        { "count": <int> },
-    "sitting":       { "count": <int> }
+    "bedrooms":       { "count": <int>, "labels": ["Bed 01", "Bed 02", ...] },
+    "ensuite":        { "count": <int> },
+    "bathroom":       { "count": <int> },
+    "powder_room":    { "count": <int> },
+    "kitchen":        { "count": <int> },
+    "laundry":        { "count": <int> },
+    "wir":            { "count": <int> },
+    "pantry":         { "count": <int> },
+    "study":          { "count": <int> },
+    "living":         { "count": <int> },
+    "dining":         { "count": <int> },
+    "sitting":        { "count": <int> },
+    "entry":          { "count": <int> },
+    "porch":          { "count": <int> },
+    "outdoor_living": { "count": <int> },
+    "hall":           { "count": <int> }
   },
   "canonical_centroids": [
     {
@@ -51,9 +101,17 @@ OUTPUT FORMAT:
       "x_pt": <float>,
       "y_pt": <float>,
       "size": <float>,
-      "reasoning": "<why this is the canonical instance>"
+      "reasoning": "<why this is canonical>"
     }
   ],
-  "ignored_spans": ["<label> (reason)"],
-  "overall_reasoning": "<one paragraph explaining how you resolved duplicates>"
+  "ignored_spans": [
+    "<label> (reason for ignoring)"
+  ],
+  "overall_reasoning": "<one paragraph explaining size clusters and dedup decisions>"
 }
+
+CONSISTENCY REQUIREMENT:
+  The "count" for each room type MUST exactly equal the number of centroids
+  of that type. Double-check before returning.
+
+Return ONLY the JSON object. No markdown fences, no wrapper text.

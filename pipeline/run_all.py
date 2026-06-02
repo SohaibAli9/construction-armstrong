@@ -7,16 +7,20 @@ Usage:
 """
 
 import argparse
+import csv
 import json
+import os
 import sys
 import time
 import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 
-from config import PDF_PATH, OUTPUT_DIR
+from config import PDF_PATH, OUTPUT_DIR, DEEPSEEK_FLASH
 
 
 def fmt_time(s: float) -> str:
@@ -32,7 +36,7 @@ def load_stage(name: str):
     return mod
 
 
-def build_final_json(classifications, areas_data, rooms_data, geometry_data, validation_data) -> dict:
+def build_final_json(classifications, areas_data, rooms_data, geometry_data, validation_data, costs: dict) -> dict:
     return {
         "project":            areas_data.get("project", {}),
         "areas":              areas_data.get("areas", {}),
@@ -47,6 +51,7 @@ def build_final_json(classifications, areas_data, rooms_data, geometry_data, val
         },
         "validation":         validation_data,
         "page_classification": classifications,
+        "costs":              costs,
     }
 
 
@@ -93,11 +98,19 @@ def main():
                         help="Start from this stage (1-6), run all remaining stages")
     parser.add_argument("--only", type=int, default=None,
                         help="Run exactly this one stage (requires prior stages already cached)")
+    parser.add_argument("--no-anim", "-n", action="store_true",
+                        help="Disable animated dashboard (plain terminal output)")
     args = parser.parse_args()
 
     # --only overrides --stage: run exactly one stage
     if args.only is not None:
         args.stage = args.only
+
+    # Import animation module — graceful fallback if Rich is missing
+    try:
+        from anim import LivePipeline as PipelineUI
+    except ImportError:
+        from anim import NoopPipeline as PipelineUI
 
     if not PDF_PATH.exists():
         print(f"ERROR: PDF not found at {PDF_PATH}")
@@ -113,26 +126,41 @@ def main():
     geometry_data   = None
     validation_data = None
 
+    costs = {"classify": 0.0, "areas": 0.0, "rooms": 0.0, "geometry": 0.0, "validate": 0.0}
+
     def cached(fname):
         p = OUTPUT_DIR / fname
         return json.loads(p.read_text()) if p.exists() else None
 
     # Load cached outputs for skipped stages — prefer Flash output over regex
     if args.stage > 1:
-        classifications = cached("classification_report_flash.json") or cached("classification_report.json")
+        raw_cl = cached("classification_report_flash.json") or cached("classification_report.json")
+        if isinstance(raw_cl, dict) and "pages" in raw_cl:
+            classifications = raw_cl["pages"]
+            costs["classify"] = raw_cl.get("cost_usd", 0.0)
+        else:
+            classifications = raw_cl
     if args.stage > 2:
         areas_data = cached("areas_flash.json") or cached("areas.json")
+        if areas_data:
+            costs["areas"] = areas_data.get("cost_usd", 0.0)
     if args.stage > 3:
         rooms_data = cached("rooms_flash.json") or cached("rooms.json")
+        if rooms_data:
+            costs["rooms"] = rooms_data.get("cost_usd", 0.0)
     if args.stage > 4:
         geometry_data = cached("geometry.json")
+        if geometry_data:
+            costs["geometry"] = geometry_data.get("cost_usd", 0.0)
     if args.stage > 5:
         validation_data = cached("validation.json")
+        if validation_data:
+            costs["validate"] = validation_data.get("cost_usd", 0.0)
 
     stages = [
-        (1, "Page classification",   "01b_classify_flash.py"),
-        (2, "Area schedule",         "02b_areas_flash.py"),
-        (3, "Room inventory",        "03b_rooms_flash.py"),
+        (1, "Page classification",   "01_classification.py"),
+        (2, "Area schedule",         "02_areas.py"),
+        (3, "Room inventory",        "03_rooms.py"),
         (4, "Wall geometry",         "04_geometry.py"),
         (5, "Validation",            "05_validate.py"),
         (6, "SVG render",            "06_render.py"),
@@ -140,41 +168,89 @@ def main():
 
     svg_path = OUTPUT_DIR / "floor_plan_extracted.svg"
 
-    for stage_num, label, filename in stages:
-        if stage_num < args.stage:
-            continue
-        if args.only is not None and stage_num > args.only:
-            break
+    with PipelineUI(total_stages=6, animate=not args.no_anim) as ui:
+        for stage_num, label, filename in stages:
+            if stage_num < args.stage:
+                continue
+            if args.only is not None and stage_num > args.only:
+                break
 
-        print(f"\n[{stage_num}/6] {label}")
-        t0 = time.time()
-        try:
-            mod = load_stage(filename)
-            if stage_num == 1:
-                classifications = mod.main(PDF_PATH, OUTPUT_DIR)
-            elif stage_num == 2:
-                areas_data = mod.main(PDF_PATH, classifications, OUTPUT_DIR)
-            elif stage_num == 3:
-                rooms_data = mod.main(PDF_PATH, classifications, OUTPUT_DIR)
-            elif stage_num == 4:
-                geometry_data = mod.main(PDF_PATH, classifications, rooms_data, OUTPUT_DIR)
-            elif stage_num == 5:
-                validation_data = mod.main(areas_data, rooms_data, geometry_data, OUTPUT_DIR)
-            elif stage_num == 6:
-                svg_path = mod.main(geometry_data, areas_data, validation_data, OUTPUT_DIR)
-        except Exception:
-            print(f"  ERROR in stage {stage_num}:")
-            traceback.print_exc()
-            print("  Continuing to next stage...")
+            idx = stage_num - 1  # zero-based
+            ui.start_stage(idx, label)
+            t0 = time.time()
 
-        print(f"  done in {fmt_time(time.time() - t0)}")
+            try:
+                mod = load_stage(filename)
+                stage_fn = {
+                    1: lambda: mod.main(PDF_PATH, OUTPUT_DIR),
+                    2: lambda: mod.main(PDF_PATH, classifications, OUTPUT_DIR),
+                    3: lambda: mod.main(PDF_PATH, classifications, OUTPUT_DIR),
+                    4: lambda: mod.main(PDF_PATH, classifications, rooms_data, OUTPUT_DIR),
+                    5: lambda: mod.main(areas_data, rooms_data, geometry_data, OUTPUT_DIR),
+                    6: lambda: mod.main(geometry_data, areas_data, validation_data, OUTPUT_DIR),
+                }[stage_num]
+
+                # Silence stage output during animation (Rich owns the terminal)
+                if args.no_anim:
+                    result = stage_fn()
+                else:
+                    devnull = open(os.devnull, "w")
+                    with redirect_stdout(devnull), redirect_stderr(devnull):
+                        result = stage_fn()
+                    devnull.close()
+
+                if stage_num == 1:
+                    classifications, costs["classify"] = result
+                elif stage_num == 2:
+                    areas_data, costs["areas"] = result
+                elif stage_num == 3:
+                    rooms_data, costs["rooms"] = result
+                elif stage_num == 4:
+                    geometry_data, costs["geometry"] = result
+                elif stage_num == 5:
+                    validation_data, costs["validate"] = result
+                elif stage_num == 6:
+                    svg_path = result
+
+            except Exception:
+                elapsed = time.time() - t0
+                ui.fail_stage(idx, error=f"failed after {elapsed:.0f}s")
+                traceback.print_exc()
+                continue
+
+            elapsed = time.time() - t0
+            ui.complete_stage(idx, elapsed=elapsed)
+
+        ui.set_cost(sum(costs.values()))
 
     # Assemble and write final JSON
     if all(x is not None for x in [classifications, areas_data, rooms_data, geometry_data, validation_data]):
-        final = build_final_json(classifications, areas_data, rooms_data, geometry_data, validation_data)
+        final = build_final_json(classifications, areas_data, rooms_data, geometry_data, validation_data, costs)
         out = OUTPUT_DIR / "extracted_data.json"
         out.write_text(json.dumps(final, indent=2))
         print(f"\n  Final JSON: {out}")
+
+        # --- Cost ledger (append row to shared CSV) ---
+        csv_path = OUTPUT_DIR.parent / "costs.csv"
+        write_header = not csv_path.exists()
+        total_cost = sum(costs.values())
+        with csv_path.open("a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["timestamp", "pdf_name", "model", "classify_cost", "areas_cost",
+                                 "rooms_cost", "geometry_cost", "validate_cost", "total_cost"])
+            writer.writerow([
+                datetime.now().isoformat(),
+                PDF_PATH.stem,
+                DEEPSEEK_FLASH,
+                round(costs["classify"], 6),
+                round(costs["areas"], 6),
+                round(costs["rooms"], 6),
+                round(costs["geometry"], 6),
+                round(costs["validate"], 6),
+                round(total_cost, 6),
+            ])
+        print(f"\n  Cost ledger: {csv_path}  (total=${total_cost:.4f})")
 
     print(f"\n  Total time: {fmt_time(time.time() - t_total)}")
     print_summary(areas_data or {}, rooms_data or {}, geometry_data or {}, validation_data or {}, svg_path)
