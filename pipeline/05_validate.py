@@ -4,15 +4,15 @@ import json
 import time
 import re
 from pathlib import Path
-from openai import OpenAI, RateLimitError
+import anthropic
 from config import (
     GT_SITE_AREA, GT_DWELLING, GT_PORCH, GT_OUTDOOR,
     GT_COVERAGE_PCT, GT_COVERAGE_M2,
     GT_LIGHTING_DWELLING,
     GT_EXPECTED_ROOMS,
     AREA_DELTA_FLAG_M2, CALIBRATION_ERROR_THRESHOLD,
-    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH,
-    DEEPSEEK_FLASH_INPUT_COST, DEEPSEEK_FLASH_OUTPUT_COST,
+    ANTHROPIC_API_KEY,
+    CLAUDE_MODEL, CLAUDE_INPUT_COST, CLAUDE_OUTPUT_COST,
 )
 import logger
 
@@ -222,7 +222,7 @@ def check_centroid_bounds(geometry_data: dict, flags: list) -> dict:
 
 
 def flash_narrative(checks: dict, flags: list, geometry_data: dict, areas: dict) -> dict:
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     payload = {
         "checks":            checks,
@@ -235,19 +235,17 @@ def flash_narrative(checks: dict, flags: list, geometry_data: dict, areas: dict)
 
     for attempt in range(3):
         try:
-            resp = client.chat.completions.create(
-                model=DEEPSEEK_FLASH,
-                messages=[
-                    {"role": "system", "content": _load_narrative_prompt()},
-                    {"role": "user",   "content": user_msg},
-                ],
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                system=_load_narrative_prompt(),
+                messages=[{"role": "user", "content": user_msg}],
                 max_tokens=1024,
                 temperature=0,
             )
-            raw     = resp.choices[0].message.content.strip()
-            in_tok  = resp.usage.prompt_tokens
-            out_tok = resp.usage.completion_tokens
-            cost    = in_tok * DEEPSEEK_FLASH_INPUT_COST + out_tok * DEEPSEEK_FLASH_OUTPUT_COST
+            raw     = resp.content[0].text.strip()
+            in_tok  = resp.usage.input_tokens
+            out_tok = resp.usage.output_tokens
+            cost    = in_tok * CLAUDE_INPUT_COST + out_tok * CLAUDE_OUTPUT_COST
 
             if raw.startswith("```"):
                 raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -260,8 +258,8 @@ def flash_narrative(checks: dict, flags: list, geometry_data: dict, areas: dict)
             logger.log(f"  anomalies: {result.get('anomalies', [])}")
             return {**result, "cost_usd": round(cost, 5)}
 
-        except (json.JSONDecodeError, RateLimitError, Exception) as e:
-            logger.error(f"Flash narrative attempt {attempt+1}: {e}")
+        except (json.JSONDecodeError, anthropic.RateLimitError, Exception) as e:
+            logger.error(f"Narrative attempt {attempt+1}: {e}")
             if attempt == 2:
                 return {"error": str(e), "confidence_score": None, "recommendation": "review", "cost_usd": 0.0}
             time.sleep(5)

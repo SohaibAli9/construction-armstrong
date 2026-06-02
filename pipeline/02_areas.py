@@ -12,14 +12,14 @@ import json
 import re
 import time
 import fitz
-from openai import OpenAI, RateLimitError
+import anthropic
 from pathlib import Path
 
 import logger
 from config import (
     PDF_PATH, OUTPUT_DIR,
-    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH,
-    DEEPSEEK_FLASH_INPUT_COST, DEEPSEEK_FLASH_OUTPUT_COST,
+    ANTHROPIC_API_KEY,
+    CLAUDE_MODEL, CLAUDE_INPUT_COST, CLAUDE_OUTPUT_COST,
 )
 
 MAX_RETRIES = 3
@@ -52,26 +52,24 @@ def load_prompt() -> str:
 
 def call_flash(page_text: str) -> tuple[dict, float]:
     """Returns (parsed_json, cost_usd). Raises on total failure."""
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     user_msg = f"Site plan page text (raw PyMuPDF output):\n\n{page_text}"
 
     for attempt in range(MAX_RETRIES):
         try:
-            logger.log(f"DeepSeek Flash call attempt {attempt+1}/{MAX_RETRIES}")
-            resp = client.chat.completions.create(
-                model=DEEPSEEK_FLASH,
-                messages=[
-                    {"role": "system", "content": load_prompt()},
-                    {"role": "user",   "content": user_msg},
-                ],
+            logger.log(f"Claude Sonnet call attempt {attempt+1}/{MAX_RETRIES}")
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                system=load_prompt(),
+                messages=[{"role": "user", "content": user_msg}],
                 max_tokens=2048,
                 temperature=0,
             )
-            raw     = resp.choices[0].message.content.strip()
-            in_tok  = resp.usage.prompt_tokens
-            out_tok = resp.usage.completion_tokens
-            cost    = in_tok * DEEPSEEK_FLASH_INPUT_COST + out_tok * DEEPSEEK_FLASH_OUTPUT_COST
+            raw     = resp.content[0].text.strip()
+            in_tok  = resp.usage.input_tokens
+            out_tok = resp.usage.output_tokens
+            cost    = in_tok * CLAUDE_INPUT_COST + out_tok * CLAUDE_OUTPUT_COST
 
             logger.log(f"Tokens: {in_tok} in / {out_tok} out  cost=${cost:.4f}")
 
@@ -83,7 +81,7 @@ def call_flash(page_text: str) -> tuple[dict, float]:
             logger.log(f"Flash response parsed OK")
             return parsed, cost
 
-        except RateLimitError:
+        except anthropic.RateLimitError:
             wait = 60 * (attempt + 1)
             logger.warn(f"Rate limit — sleeping {wait}s")
             time.sleep(wait)
@@ -99,7 +97,7 @@ def call_flash(page_text: str) -> tuple[dict, float]:
                 raise
             time.sleep(5 * (attempt + 1))
 
-    raise RuntimeError("DeepSeek Flash call failed after all retries")
+    raise RuntimeError("Claude Sonnet call failed after all retries")
 
 
 def main(pdf_path: Path, classifications: list[dict], output_dir: Path) -> tuple[dict, float]:

@@ -24,13 +24,13 @@ import re
 import time
 import fitz
 from collections import defaultdict
-from openai import OpenAI, RateLimitError
+import anthropic
 from pathlib import Path
 
 from config import (
     MM_PER_PT, GT_OVERALL_MM, CALIBRATION_ERROR_THRESHOLD,
-    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH,
-    DEEPSEEK_FLASH_INPUT_COST, DEEPSEEK_FLASH_OUTPUT_COST,
+    ANTHROPIC_API_KEY,
+    CLAUDE_MODEL, CLAUDE_INPUT_COST, CLAUDE_OUTPUT_COST,
 )
 import logger
 
@@ -658,7 +658,7 @@ def calibrate_with_flash(candidates: list[dict], dim_pos: dict, target_mm: int) 
         logger.warn("No calibration candidates — using nominal")
         return _nominal_calibration("nominal_no_candidates")
 
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     lines = [
         f"Dimension text '{target_mm}' at PDF point ({dim_pos['x_pt']:.1f}, {dim_pos['y_pt']:.1f}).",
@@ -676,19 +676,17 @@ def calibrate_with_flash(candidates: list[dict], dim_pos: dict, target_mm: int) 
 
     for attempt in range(3):
         try:
-            resp = client.chat.completions.create(
-                model=DEEPSEEK_FLASH,
-                messages=[
-                    {"role": "system", "content": load_calib_prompt()},
-                    {"role": "user",   "content": user_msg},
-                ],
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                system=load_calib_prompt(),
+                messages=[{"role": "user", "content": user_msg}],
                 max_tokens=1024,
                 temperature=0,
             )
-            raw    = resp.choices[0].message.content.strip()
-            in_tok = resp.usage.prompt_tokens
-            out_tok = resp.usage.completion_tokens
-            cost   = in_tok * DEEPSEEK_FLASH_INPUT_COST + out_tok * DEEPSEEK_FLASH_OUTPUT_COST
+            raw    = resp.content[0].text.strip()
+            in_tok = resp.usage.input_tokens
+            out_tok = resp.usage.output_tokens
+            cost   = in_tok * CLAUDE_INPUT_COST + out_tok * CLAUDE_OUTPUT_COST
 
             if raw.startswith("```"):
                 raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -726,7 +724,7 @@ def calibrate_with_flash(candidates: list[dict], dim_pos: dict, target_mm: int) 
                 "cost_usd":           round(cost, 5),
             }
 
-        except (json.JSONDecodeError, RateLimitError, Exception) as e:
+        except (json.JSONDecodeError, anthropic.RateLimitError, Exception) as e:
             logger.error(f"Calibration Flash attempt {attempt+1}: {e}")
             if attempt == 2:
                 return _nominal_calibration("nominal_flash_error", str(e))

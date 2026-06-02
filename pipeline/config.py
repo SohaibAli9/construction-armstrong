@@ -14,6 +14,12 @@ DEEPSEEK_FLASH    = "deepseek-chat"   # maps to DeepSeek-V4 Flash
 DEEPSEEK_FLASH_INPUT_COST  = 0.14 / 1_000_000
 DEEPSEEK_FLASH_OUTPUT_COST = 0.28 / 1_000_000
 
+# Claude fallback (used when DEEPSEEK_API_KEY has no balance)
+CLAUDE_MODEL       = "claude-sonnet-4-6"
+# claude-sonnet-4-6 pricing (per M tokens): $3.00 input, $15.00 output
+CLAUDE_INPUT_COST  = 3.00 / 1_000_000
+CLAUDE_OUTPUT_COST = 15.00 / 1_000_000
+
 ROOT       = Path(__file__).parent
 SAMPLE_DIR = ROOT.parent / "sample"
 
