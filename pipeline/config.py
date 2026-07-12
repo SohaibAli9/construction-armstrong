@@ -5,9 +5,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY")
+# Routed through the local LiteLLM gateway (per-app metering). Falls back to direct DeepSeek if the
+# gateway key isn't in the env (e.g. keys.env not sourced) so the app never hard-breaks.
+DEEPSEEK_API_KEY  = os.getenv("LLM_GW_KEY_PROCALC") or os.getenv("DEEPSEEK_API_KEY")
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BASE_URL = os.getenv("LLM_GW_URL", "http://localhost:4000") if os.getenv("LLM_GW_KEY_PROCALC") else "https://api.deepseek.com"
 DEEPSEEK_FLASH    = "deepseek-chat"   # maps to DeepSeek-V4 Flash
 
 # DeepSeek V4 Flash pricing (per M tokens): $0.14 input, $0.28 output
@@ -46,7 +48,7 @@ _GROUND_TRUTHS: dict[str, dict] = {
         "lighting_porch":    1.98,
         "lighting_outdoor":  26.57,
         "expected_rooms": {
-            "bedroom": 3, "wir": 1, "ensuite": 1, "bathroom": 1,
+            "bedrooms": 3, "wir": 1, "ensuite": 1, "bathroom": 1,
             "powder_room": 1, "laundry": 1, "kitchen": 1, "dining": 1,
             "living": 1, "sitting": 1, "entry": 1, "porch": 1,
             "study": 1, "pantry": 1, "outdoor_living": 1,

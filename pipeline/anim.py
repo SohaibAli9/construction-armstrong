@@ -81,6 +81,9 @@ class LivePipeline:
 
     # ── lifecycle ───────────────────────────────────────────────────
 
+    def __rich_console__(self, console, options):
+        yield self._build()
+
     def __enter__(self):
         if not self.animate:
             return self
@@ -89,9 +92,9 @@ class LivePipeline:
         from rich.console import Console
         from rich.live import Live
 
-        self._console = Console()
+        self._console = Console(force_terminal=True)
         self.t_start = time.time()
-        self._live = Live(self._build(), console=self._console, refresh_per_second=10)
+        self._live = Live(self, console=self._console, refresh_per_second=10)
         self._live.__enter__()
         return self
 
